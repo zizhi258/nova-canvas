@@ -1,14 +1,32 @@
 "use client";
 
+import { unzipSync } from "fflate";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  clearGenerations,
+  exportAllToFolder,
+  filenameFor,
+  hasDirectoryPermission,
+  loadGenerations,
+  loadLocalSetting,
+  LocalDirectoryHandle,
+  saveGeneration,
+  saveLocalSetting,
+  StoredGeneration,
+  syncGenerationFolder,
+} from "./local-persistence";
+import TagMarket from "./tag-market";
 
 type Channel = "official" | "relay";
 type GeneratedImage = {
   id: number;
   src: string;
+  blob: Blob;
   prompt: string;
   model: string;
   size: string;
+  createdAt: string;
+  filename: string;
 };
 
 const models = [
@@ -32,10 +50,77 @@ const progressCopy = [
   { at: 86, label: "正在完成高质量渲染" },
 ];
 
+const OFFICIAL_ENDPOINT = "https://image.novelai.net/ai/generate-image";
+
+function imageType(name: string, bytes: Uint8Array) {
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".webp") || (bytes[0] === 0x52 && bytes[1] === 0x49)) return "image/webp";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || (bytes[0] === 0xff && bytes[1] === 0xd8)) return "image/jpeg";
+  return "image/png";
+}
+
+function decodeBase64Image(value: string) {
+  const normalized = value.includes(",") ? value.split(",").pop()! : value;
+  const binary = atob(normalized);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+async function upstreamError(response: Response, fallback: string) {
+  const detail = await response.text().catch(() => "");
+  try {
+    const parsed = JSON.parse(detail) as { error?: { message?: string } | string; message?: string };
+    return typeof parsed.error === "string" ? parsed.error : parsed.error?.message || parsed.message || fallback;
+  } catch {
+    return detail && detail.length < 220 ? detail : fallback;
+  }
+}
+
+async function officialImage(response: Response) {
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.startsWith("image/")) return response.blob();
+
+  if (contentType.includes("json")) {
+    const data = (await response.json()) as {
+      images?: Array<string | { image?: string; b64_json?: string; base64?: string; data?: string; url?: string }>;
+      data?: Array<{ image?: string; b64_json?: string; base64?: string; data?: string; url?: string }>;
+    };
+    const candidate = data.images?.[0] ?? data.data?.[0];
+    if (typeof candidate === "string") {
+      const bytes = decodeBase64Image(candidate);
+      return new Blob([bytes.slice().buffer], { type: imageType("result", bytes) });
+    }
+    const encoded = candidate?.image || candidate?.b64_json || ("base64" in (candidate || {}) ? candidate?.base64 : undefined) || ("data" in (candidate || {}) ? candidate?.data : undefined);
+    if (encoded) {
+      const bytes = decodeBase64Image(encoded);
+      return new Blob([bytes.slice().buffer], { type: imageType("result", bytes) });
+    }
+    if (candidate?.url) {
+      const image = await fetch(candidate.url);
+      if (!image.ok) throw new Error("NovelAI 返回的图片链接无法读取。 ");
+      return image.blob();
+    }
+    throw new Error("NovelAI 响应中没有图片数据。 ");
+  }
+
+  const archive = new Uint8Array(await response.arrayBuffer());
+  try {
+    const files = unzipSync(archive);
+    const entry = Object.entries(files).find(([name]) => /\.(png|jpe?g|webp)$/i.test(name));
+    if (!entry) throw new Error("压缩包中没有图片");
+    return new Blob([entry[1].slice().buffer], { type: imageType(entry[0], entry[1]) });
+  } catch {
+    throw new Error("NovelAI 返回的图片数据无法解压。 ");
+  }
+}
+
 export default function Home() {
   const [channel, setChannel] = useState<Channel>("official");
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
+  const [rememberKey, setRememberKey] = useState(false);
+  const [keyStorageReady, setKeyStorageReady] = useState(false);
   const [relayUrl, setRelayUrl] = useState("");
   const [prompt, setPrompt] = useState("1girl, silver hair, standing in a field of luminous flowers, starry night, cinematic lighting, intricate details");
   const [negativePrompt, setNegativePrompt] = useState("lowres, blurry, bad anatomy, extra fingers, watermark, text");
@@ -46,11 +131,16 @@ export default function Home() {
   const [sampler, setSampler] = useState("k_euler_ancestral");
   const [seed, setSeed] = useState("");
   const [advanced, setAdvanced] = useState(false);
+  const [tagMarketOpen, setTagMarketOpen] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState("");
+  const [storageNotice, setStorageNotice] = useState("");
   const [images, setImages] = useState<GeneratedImage[]>([]);
+  const [directory, setDirectory] = useState<LocalDirectoryHandle | null>(null);
+  const [directoryName, setDirectoryName] = useState("");
   const controllerRef = useRef<AbortController | null>(null);
+  const objectUrlsRef = useRef<string[]>([]);
 
   const progressLabel = useMemo(
     () => [...progressCopy].reverse().find((item) => progress >= item.at)?.label ?? progressCopy[0].label,
@@ -58,8 +148,51 @@ export default function Home() {
   );
 
   useEffect(() => {
-    return () => controllerRef.current?.abort();
+    let active = true;
+    const trackedUrls = objectUrlsRef.current;
+    void Promise.resolve().then(() => {
+      if (!active) return;
+      const savedKey = window.localStorage.getItem("nova-canvas:api-key");
+      const shouldRemember = window.localStorage.getItem("nova-canvas:remember-key") === "true";
+      if (shouldRemember && savedKey) setApiKey(savedKey);
+      setRememberKey(shouldRemember);
+      setKeyStorageReady(true);
+    });
+
+    void loadGenerations()
+      .then((records) => {
+        if (!active) return;
+        setImages(
+          records.map((record) => {
+            const src = URL.createObjectURL(record.blob);
+            objectUrlsRef.current.push(src);
+            return { ...record, src };
+          }),
+        );
+      })
+      .catch(() => active && setStorageNotice("浏览器未能读取之前保存的生成记录。 "));
+
+    void loadLocalSetting<LocalDirectoryHandle>("directory")
+      .then(async (savedDirectory) => {
+        if (!active || !savedDirectory || !(await hasDirectoryPermission(savedDirectory))) return;
+        setDirectory(savedDirectory);
+        setDirectoryName(savedDirectory.name);
+      })
+      .catch(() => undefined);
+
+    return () => {
+      active = false;
+      controllerRef.current?.abort();
+      trackedUrls.forEach((url) => URL.revokeObjectURL(url));
+    };
   }, []);
+
+  useEffect(() => {
+    if (!keyStorageReady) return;
+    window.localStorage.setItem("nova-canvas:remember-key", String(rememberKey));
+    if (rememberKey && apiKey) window.localStorage.setItem("nova-canvas:api-key", apiKey);
+    else window.localStorage.removeItem("nova-canvas:api-key");
+  }, [apiKey, keyStorageReady, rememberKey]);
 
   async function generate(event: FormEvent) {
     event.preventDefault();
@@ -90,38 +223,134 @@ export default function Home() {
     }, 520);
 
     try {
-      const response = await fetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify({
-          channel,
-          apiKey,
-          relayUrl: channel === "relay" ? relayUrl : undefined,
-          prompt,
-          negativePrompt,
-          model,
-          size,
-          steps,
+      const generatedSeed = seed ? Number(seed) : Math.floor(Math.random() * 4_294_967_295);
+      let blob: Blob;
+
+      if (channel === "official") {
+        const [width, height] = size.split("x").map(Number);
+        const cleanPrompt = prompt.trim();
+        const correlationId = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
+        const isV4 = model.startsWith("nai-diffusion-4");
+        const parameters = {
+          params_version: 3,
+          width,
+          height,
           scale,
           sampler,
-          seed: seed ? Number(seed) : undefined,
-        }),
-      });
-
-      if (!response.ok) {
-        const data = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(data?.error || `生成失败（${response.status}）`);
+          steps,
+          n_samples: 1,
+          seed: generatedSeed,
+          prompt: cleanPrompt,
+          negative_prompt: negativePrompt,
+          ucPreset: 0,
+          qualityToggle: true,
+          sm: false,
+          sm_dyn: false,
+          dynamic_thresholding: false,
+          controlnet_strength: 1,
+          legacy: false,
+          add_original_image: true,
+          cfg_rescale: 0,
+          noise_schedule: "karras",
+          legacy_v3_extend: false,
+          deliberate_euler_ancestral_bug: false,
+          prefer_brownian: true,
+          ...(isV4
+            ? {
+                skip_cfg_above_sigma: null,
+                v4_prompt: {
+                  caption: { base_caption: cleanPrompt, char_captions: [] },
+                  use_coords: false,
+                  use_order: true,
+                  legacy_uc: false,
+                },
+                v4_negative_prompt: {
+                  caption: { base_caption: negativePrompt, char_captions: [] },
+                  use_coords: false,
+                  use_order: false,
+                  legacy_uc: false,
+                },
+              }
+            : {}),
+        };
+        const response = await fetch(OFFICIAL_ENDPOINT, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey.trim()}`,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+            "X-Correlation-Id": correlationId,
+            "X-Initiated-At": new Date().toISOString(),
+          },
+          signal: controller.signal,
+          body: JSON.stringify({
+            input: cleanPrompt,
+            model,
+            action: "generate",
+            parameters,
+          }),
+        });
+        if (!response.ok) {
+          const message = await upstreamError(response, `NovelAI 返回 ${response.status}`);
+          throw new Error(response.status >= 500 ? `${message}（请求编号：${correlationId}）` : message);
+        }
+        blob = await officialImage(response);
+      } else {
+        const response = await fetch("/api/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({
+            channel,
+            apiKey,
+            relayUrl,
+            prompt,
+            negativePrompt,
+            model,
+            size,
+            steps,
+            scale,
+            sampler,
+            seed: generatedSeed,
+          }),
+        });
+        if (!response.ok) {
+          const data = (await response.json().catch(() => null)) as { error?: string } | null;
+          throw new Error(data?.error || `生成失败（${response.status}）`);
+        }
+        blob = await response.blob();
       }
 
       setProgress(96);
-      const blob = await response.blob();
       if (!blob.type.startsWith("image/")) throw new Error("生成服务没有返回可显示的图片。 ");
+      const id = Date.now();
+      const createdAt = new Date().toISOString();
+      const filename = filenameFor(id, blob);
+      const record: StoredGeneration = { id, blob, prompt: prompt.trim(), model, size, createdAt, filename };
       const src = URL.createObjectURL(blob);
-      setImages((current) => [
-        { id: Date.now(), src, prompt: prompt.trim(), model, size },
-        ...current,
-      ]);
+      objectUrlsRef.current.push(src);
+      const nextImages = [{ ...record, src }, ...images];
+      setImages(nextImages);
+      try {
+        await saveGeneration(record);
+        if (directory) {
+          const stored = nextImages.map(({ id: imageId, blob: imageBlob, prompt: imagePrompt, model: imageModel, size: imageSize, createdAt: imageCreatedAt, filename: imageFilename }) => ({
+            id: imageId,
+            blob: imageBlob,
+            prompt: imagePrompt,
+            model: imageModel,
+            size: imageSize,
+            createdAt: imageCreatedAt,
+            filename: imageFilename,
+          }));
+          await syncGenerationFolder(directory, stored, record);
+          setStorageNotice(`图片已保存到浏览器和“${directory.name}”文件夹。`);
+        } else {
+          setStorageNotice("图片已保存在当前浏览器；选择本地文件夹后可同步图片与 JSON。 ");
+        }
+      } catch (storageError) {
+        setStorageNotice((storageError as Error).message || "图片已生成，但本地持久化失败。 ");
+      }
       setProgress(100);
     } catch (reason) {
       if ((reason as Error).name !== "AbortError") {
@@ -143,6 +372,59 @@ export default function Home() {
     setProgress(0);
   }
 
+  function appendTags(value: string, target: "positive" | "negative") {
+    const update = (current: string) => {
+      const existing = current.split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+      const additions = value.split(",").map((item) => item.trim()).filter((item) => item && !existing.includes(item.toLowerCase()));
+      return [current.trim().replace(/,\s*$/, ""), ...additions].filter(Boolean).join(", ");
+    };
+    if (target === "positive") setPrompt(update);
+    else setNegativePrompt(update);
+  }
+
+  function forgetApiKey() {
+    setRememberKey(false);
+    setApiKey("");
+    window.localStorage.removeItem("nova-canvas:api-key");
+    window.localStorage.setItem("nova-canvas:remember-key", "false");
+    setStorageNotice("已清除当前浏览器保存的 API Key。 ");
+  }
+
+  async function chooseDirectory() {
+    const picker = (window as Window & {
+      showDirectoryPicker?: (options?: { mode?: "readwrite" }) => Promise<LocalDirectoryHandle>;
+    }).showDirectoryPicker;
+    if (!picker) {
+      setStorageNotice("当前浏览器不支持文件夹写入；图片仍会保存在浏览器本地数据库中。 ");
+      return;
+    }
+    try {
+      const selected = await picker({ mode: "readwrite" });
+      if (!(await hasDirectoryPermission(selected, true))) throw new Error("没有获得文件夹写入权限。 ");
+      const records = await loadGenerations();
+      await exportAllToFolder(selected, records);
+      await saveLocalSetting("directory", selected);
+      setDirectory(selected);
+      setDirectoryName(selected.name);
+      setStorageNotice(`已连接“${selected.name}”，现有图片和 nova-canvas.json 已同步。`);
+    } catch (reason) {
+      if ((reason as Error).name !== "AbortError") setStorageNotice((reason as Error).message || "无法连接本地文件夹。 ");
+    }
+  }
+
+  async function clearLocalHistory() {
+    if (!window.confirm("确定清空当前浏览器中的生成记录吗？已同步到文件夹的图片文件不会被删除。")) return;
+    try {
+      await clearGenerations();
+      images.forEach((image) => URL.revokeObjectURL(image.src));
+      setImages([]);
+      if (directory) await syncGenerationFolder(directory, []);
+      setStorageNotice("浏览器生成记录已清空；本地文件夹中的图片文件保持不变。 ");
+    } catch (reason) {
+      setStorageNotice((reason as Error).message || "清空本地记录失败。 ");
+    }
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -150,7 +432,7 @@ export default function Home() {
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
           <span>NOVA <b>CANVAS</b></span>
         </a>
-        <div className="topbar-note"><span className="live-dot" /> API 直连 · 密钥不留存</div>
+        <div className="topbar-note"><span className="live-dot" /> API 直连 · 本机可选保存</div>
         <a className="help-link" href="#guide">接入指南 <span>↗</span></a>
       </header>
 
@@ -163,7 +445,7 @@ export default function Home() {
         <div className="hero-stats" aria-label="产品特点">
           <div><strong>V4.5</strong><span>最新模型</span></div>
           <div><strong>1:1</strong><span>原图质量</span></div>
-          <div><strong>0</strong><span>密钥留存</span></div>
+          <div><strong>LOCAL</strong><span>本机存储</span></div>
         </div>
       </section>
 
@@ -197,14 +479,27 @@ export default function Home() {
             <label className="field">
               <span>API Key <b>必填</b></span>
               <div className="input-wrap"><span className="input-icon">⌘</span><input type={showKey ? "text" : "password"} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="输入你的 API Key" autoComplete="off" /><button type="button" className="key-toggle" onClick={() => setShowKey((value) => !value)} aria-label={showKey ? "隐藏密钥" : "显示密钥"}>{showKey ? "隐藏" : "显示"}</button></div>
-              <small><span className="mini-lock">◆</span> 仅在本次生成请求中使用，不会保存或记录</small>
+              <small><span className="mini-lock">◆</span> 默认仅用于当前页面；可选择只在此浏览器记住</small>
             </label>
+            <div className="persistence-controls">
+              <div className="remember-row">
+                <label><input type="checkbox" checked={rememberKey} onChange={(event) => setRememberKey(event.target.checked)} /><span>在此浏览器记住 API Key</span></label>
+                {rememberKey && apiKey && <button type="button" onClick={forgetApiKey}>清除 Key</button>}
+              </div>
+              <p>Key 不会写入图片或 JSON，但同一浏览器中的脚本、本机用户及扩展可能读取它。</p>
+              <div className="folder-row">
+                <div><b>{directoryName || "尚未选择图片文件夹"}</b><small>图片始终保存在浏览器；授权后同时写入图片文件和 nova-canvas.json</small></div>
+                <button type="button" onClick={chooseDirectory}>{directoryName ? "更换文件夹" : "选择文件夹"}</button>
+              </div>
+              {storageNotice && <p className="storage-notice" role="status">{storageNotice}</p>}
+            </div>
           </section>
 
           <section className="panel prompt-panel">
             <div className="section-heading">
               <span className="step-number">02</span>
               <div><h2>描述画面</h2><p>详细的英文提示词通常会获得更稳定的效果</p></div>
+              <button type="button" className="tag-market-trigger" onClick={() => setTagMarketOpen(true)}><span>✦</span> 标签超市</button>
             </div>
             <label className="field prompt-field">
               <span>正向提示词</span>
@@ -268,13 +563,14 @@ export default function Home() {
             )}
             {error && <p className="error-message">{error}</p>}
             <button className="generate-button" type="submit" disabled={isGenerating}><span className="spark">✦</span><span>{isGenerating ? "正在生成..." : "开始生成"}<small>{isGenerating ? "请保持当前页面开启" : "预计消耗 25–32 Anlas"}</small></span><b>→</b></button>
-            <p className="privacy-note"><span>◇</span> 请求由你的浏览器安全发送，本站不存储密钥与图片</p>
+            <p className="privacy-note"><span>◇</span> 官方请求由浏览器直连；记录仅保存在你的设备</p>
           </section>
         </div>
       </form>
+      <TagMarket open={tagMarketOpen} onClose={() => setTagMarketOpen(false)} onApply={appendTags} />
 
       <section className="results-section" aria-labelledby="results-title">
-        <div className="results-heading"><div><p className="eyebrow"><span>✦</span> YOUR CREATIONS</p><h2 id="results-title">创作结果</h2></div><span>{images.length ? `${images.length} 张作品` : "等待第一次灵感"}</span></div>
+        <div className="results-heading"><div><p className="eyebrow"><span>✦</span> YOUR CREATIONS</p><h2 id="results-title">创作结果</h2></div><div className="results-tools"><span>{images.length ? `${images.length} 张本机作品` : "等待第一次灵感"}</span>{images.length > 0 && <button type="button" onClick={clearLocalHistory}>清空本机记录</button>}</div></div>
         {images.length === 0 ? (
           <div className="empty-result"><div className="empty-art"><i /><i /><span>✦</span></div><h3>画布已经准备好了</h3><p>完成上方设置并开始生成，你的作品会出现在这里。</p></div>
         ) : (
@@ -283,7 +579,7 @@ export default function Home() {
               <article className="image-card" key={image.id}>
                 {/* Generated result URLs are local object URLs created from the API response. */}
                 <img src={image.src} alt={image.prompt} />
-                <div className="image-overlay"><span>{image.model.replace("nai-diffusion-", "V")}</span><a href={image.src} download={`nova-${image.id}.png`}>下载原图 ↓</a></div>
+                <div className="image-overlay"><span>{image.model.replace("nai-diffusion-", "V")}</span><a href={image.src} download={image.filename}>下载原图 ↓</a></div>
                 <p>{image.prompt}</p>
               </article>
             ))}

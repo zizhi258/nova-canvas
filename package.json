@@ -11,6 +11,7 @@
     "start": "vinext start",
     "test": "vinext build && node --test tests/rendered-html.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "tags:import": "node scripts/import-tag-market-data.mjs",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {

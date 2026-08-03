@@ -1,5 +1,3 @@
-import { unzipSync } from "fflate";
-
 export const runtime = "edge";
 
 type GenerateRequest = {
@@ -16,7 +14,6 @@ type GenerateRequest = {
   seed?: number;
 };
 
-const OFFICIAL_ENDPOINT = "https://image.novelai.net/ai/generate-image";
 const ALLOWED_MODELS = new Set([
   "nai-diffusion-4-5-full",
   "nai-diffusion-4-5-curated",
@@ -45,15 +42,6 @@ function decodeBase64(value: string) {
   return bytes;
 }
 
-function imageType(name: string, bytes: Uint8Array) {
-  const lower = name.toLowerCase();
-  if (lower.endsWith(".webp")) return "image/webp";
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
-  if (bytes[0] === 0x52 && bytes[1] === 0x49) return "image/webp";
-  if (bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg";
-  return "image/png";
-}
-
 export async function POST(request: Request) {
   let body: GenerateRequest;
   try {
@@ -68,7 +56,8 @@ export async function POST(request: Request) {
   if (!apiKey) return jsonError("缺少 API Key。 ");
   if (!prompt) return jsonError("提示词不能为空。 ");
   if (prompt.length > 1800) return jsonError("提示词过长。 ");
-  if (channel === "relay" && !body.relayUrl?.trim()) return jsonError("缺少中转服务 URL。 ");
+  if (channel !== "relay") return jsonError("官方渠道已改为浏览器直连，请刷新页面后重试。 ");
+  if (!body.relayUrl?.trim()) return jsonError("缺少中转服务 URL。 ");
 
   const [width, height] = (body.size || "832x1216").split("x").map(Number);
   const model = ALLOWED_MODELS.has(body.model || "") ? body.model! : "nai-diffusion-4-5-full";
@@ -78,41 +67,10 @@ export async function POST(request: Request) {
 
   let endpoint: string;
   try {
-    endpoint = channel === "official" ? OFFICIAL_ENDPOINT : normalizeRelayUrl(body.relayUrl!);
+    endpoint = normalizeRelayUrl(body.relayUrl);
   } catch {
     return jsonError("中转服务 URL 格式不正确。 ");
   }
-
-  const officialPayload = {
-    input: prompt,
-    model,
-    action: "generate",
-    parameters: {
-      params_version: 3,
-      width,
-      height,
-      scale,
-      sampler: body.sampler || "k_euler_ancestral",
-      steps,
-      n_samples: 1,
-      ucPreset: 0,
-      qualityToggle: true,
-      sm: false,
-      sm_dyn: false,
-      dynamic_thresholding: false,
-      controlnet_strength: 1,
-      legacy: false,
-      add_original_image: true,
-      uncond_scale: 1,
-      cfg_rescale: 0,
-      noise_schedule: "karras",
-      legacy_v3_extend: false,
-      skip_cfg_above_sigma: null,
-      use_coords: false,
-      negative_prompt: body.negativePrompt || "",
-      seed,
-    },
-  };
 
   const relayPayload = {
     model,
@@ -137,7 +95,7 @@ export async function POST(request: Request) {
         "Content-Type": "application/json",
         Accept: "application/zip, image/*, application/json",
       },
-      body: JSON.stringify(channel === "official" ? officialPayload : relayPayload),
+      body: JSON.stringify(relayPayload),
     });
 
     if (!upstream.ok) {
@@ -172,11 +130,7 @@ export async function POST(request: Request) {
       return jsonError("中转服务响应中没有图片数据。 ", 502);
     }
 
-    const archive = new Uint8Array(await upstream.arrayBuffer());
-    const files = unzipSync(archive);
-    const entry = Object.entries(files).find(([name]) => /\.(png|jpe?g|webp)$/i.test(name));
-    if (!entry) return jsonError("NovelAI 返回的压缩包中没有图片。 ", 502);
-    return new Response(entry[1], { headers: { "Content-Type": imageType(entry[0], entry[1]), "Cache-Control": "no-store" } });
+    return jsonError("中转服务返回了不支持的响应格式。 ", 502);
   } catch (error) {
     const message = error instanceof Error ? error.message : "无法连接生成服务";
     return jsonError(`连接生成服务失败：${message}`, 502);
