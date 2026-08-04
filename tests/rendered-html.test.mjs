@@ -14,6 +14,20 @@ test("ships the Nova Canvas product experience", async () => {
   assert.doesNotMatch(page, /SkeletonPreview/);
 });
 
+test("tag market keeps complete-path recursive navigation", async () => {
+  const source = await readFile(new URL("../app/tag-market.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /selectedPath/);
+  assert.match(source, /function completePath/);
+  assert.match(source, /childFolders/);
+  assert.match(source, /tag-breadcrumbs/);
+  assert.match(source, /datasetId === "favorites"/);
+  assert.match(source, /datasetId === "custom"/);
+  assert.match(source, /datasetId === "all"/);
+  assert.match(source, /dataset\.adult \? "adult"/);
+  assert.doesNotMatch(source, /filter\(\s*\(tag\)\s*=>\s*!tag\.adult/);
+});
+
 test("ships the complete migrated tag market catalog", async () => {
   const catalog = JSON.parse(await readFile(new URL("../public/tag-market/catalog.json", import.meta.url), "utf8"));
   assert.equal(catalog.license, "CC0-1.0");
