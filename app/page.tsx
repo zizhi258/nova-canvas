@@ -8,10 +8,13 @@ import {
   filenameFor,
   hasDirectoryPermission,
   loadGenerations,
+  loadArtistThreadFavorites,
   loadLocalSetting,
   LocalDirectoryHandle,
   saveGeneration,
+  saveArtistThreadFavorites,
   saveLocalSetting,
+  ArtistThreadFavorite,
   StoredGeneration,
   syncGenerationFolder,
 } from "./local-persistence";
@@ -31,6 +34,13 @@ type GeneratedImage = {
   size: string;
   createdAt: string;
   filename: string;
+};
+
+type ArtistThread = {
+  id: string;
+  artistPrompt: string;
+  images: GeneratedImage[];
+  favorite?: ArtistThreadFavorite;
 };
 
 const models = [
@@ -66,6 +76,19 @@ function joinPromptParts(...parts: string[]) {
 
 function displayPrompt(image: Pick<GeneratedImage, "artistPrompt" | "positivePrompt" | "prompt">) {
   return joinPromptParts(image.artistPrompt, image.positivePrompt || image.prompt || "");
+}
+
+function normalizedArtistPrompt(value: string) {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function artistThreadKey(value: string) {
+  const normalized = normalizedArtistPrompt(value);
+  return normalized ? `artist:${normalized.toLocaleLowerCase()}` : "artist:untitled";
+}
+
+function artistThreadLabel(value: string) {
+  return normalizedArtistPrompt(value) || "未填写画师串";
 }
 
 function imageType(name: string, bytes: Uint8Array) {
@@ -155,6 +178,9 @@ export default function Home() {
   const [storageNotice, setStorageNotice] = useState("");
   const [images, setImages] = useState<GeneratedImage[]>([]);
   const [lightboxImage, setLightboxImage] = useState<GeneratedImage | null>(null);
+  const [artistFavorites, setArtistFavorites] = useState<ArtistThreadFavorite[]>([]);
+  const [favoritesOpen, setFavoritesOpen] = useState(false);
+  const [selectedArtistThreadId, setSelectedArtistThreadId] = useState<string | null>(null);
   const [directory, setDirectory] = useState<LocalDirectoryHandle | null>(null);
   const [directoryName, setDirectoryName] = useState("");
   const controllerRef = useRef<AbortController | null>(null);
@@ -178,6 +204,36 @@ export default function Home() {
     () => [...progressCopy].reverse().find((item) => progress >= item.at)?.label ?? progressCopy[0].label,
     [progress],
   );
+
+  const artistThreads = useMemo<ArtistThread[]>(() => {
+    const grouped = new Map<string, GeneratedImage[]>();
+    for (const image of images) {
+      const key = artistThreadKey(image.artistPrompt);
+      const existing = grouped.get(key);
+      if (existing) existing.push(image);
+      else grouped.set(key, [image]);
+    }
+    return [...grouped.entries()].map(([id, threadImages]) => ({
+      id,
+      artistPrompt: threadImages[0]?.artistPrompt || "",
+      images: threadImages,
+      favorite: artistFavorites.find((favorite) => favorite.id === id || artistThreadKey(favorite.artistPrompt) === id),
+    }));
+  }, [artistFavorites, images]);
+
+  const favoriteThreads = useMemo<ArtistThread[]>(
+    () => artistFavorites.map((favorite) => ({
+      id: favorite.id,
+      artistPrompt: favorite.artistPrompt,
+      images: artistThreads.find((thread) => thread.id === favorite.id || artistThreadKey(thread.artistPrompt) === artistThreadKey(favorite.artistPrompt))?.images || [],
+      favorite,
+    })),
+    [artistFavorites, artistThreads],
+  );
+
+  const selectedArtistThread = selectedArtistThreadId
+    ? favoriteThreads.find((thread) => thread.id === selectedArtistThreadId) || null
+    : null;
 
   useEffect(() => {
     let active = true;
@@ -203,6 +259,12 @@ export default function Home() {
         );
       })
       .catch(() => active && setStorageNotice("浏览器未能读取之前保存的生成记录。 "));
+
+    void loadArtistThreadFavorites()
+      .then((favorites) => {
+        if (active) setArtistFavorites(favorites);
+      })
+      .catch(() => active && setStorageNotice("无法读取之前保存的画师串收藏。"));
 
     void loadLocalSetting<LocalDirectoryHandle>("directory")
       .then(async (savedDirectory) => {
@@ -297,7 +359,6 @@ export default function Home() {
           prefer_brownian: true,
           ...(isV4
             ? {
-                skip_cfg_above_sigma: null,
                 v4_prompt: {
                   caption: { base_caption: cleanPrompt, char_captions: [] },
                   use_coords: false,
@@ -485,20 +546,113 @@ export default function Home() {
     document.querySelector(".prompt-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
+  function persistArtistFavorites(nextFavorites: ArtistThreadFavorite[]) {
+    setArtistFavorites(nextFavorites);
+    void saveArtistThreadFavorites(nextFavorites).catch((reason) => {
+      setStorageNotice((reason as Error).message || "画师串收藏保存失败。");
+    });
+  }
+
+  function favoriteForThread(threadId: string, artistPrompt: string) {
+    return artistFavorites.find((favorite) => favorite.id === threadId || artistThreadKey(favorite.artistPrompt) === artistThreadKey(artistPrompt));
+  }
+
+  function toggleArtistThreadFavorite(artistPrompt: string) {
+    const id = artistThreadKey(artistPrompt);
+    const existing = favoriteForThread(id, artistPrompt);
+    const nextFavorites = existing
+      ? artistFavorites.filter((favorite) => favorite !== existing)
+      : [
+          ...artistFavorites,
+          {
+            id,
+            artistPrompt: normalizedArtistPrompt(artistPrompt),
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
+        ];
+    persistArtistFavorites(nextFavorites);
+    if (existing && selectedArtistThreadId === existing.id) {
+      setSelectedArtistThreadId(null);
+    }
+  }
+
+  function setArtistThreadCover(thread: ArtistThread, imageId: number) {
+    const favorite = favoriteForThread(thread.id, thread.artistPrompt);
+    if (!favorite) return;
+    const nextFavorites = artistFavorites.map((candidate) => (
+      candidate === favorite
+        ? { ...candidate, coverImageId: imageId, updatedAt: new Date().toISOString() }
+        : candidate
+    ));
+    persistArtistFavorites(nextFavorites);
+  }
+
+  function coverForThread(thread: ArtistThread) {
+    return thread.images.find((image) => image.id === thread.favorite?.coverImageId) || thread.images[0] || null;
+  }
+
+  function renderImageCard(image: GeneratedImage, thread?: ArtistThread) {
+    const resolvedThread = thread || artistThreads.find((candidate) => candidate.id === artistThreadKey(image.artistPrompt));
+    const favorite = resolvedThread?.favorite;
+    return (
+      <article className="image-card" key={image.id}>
+        {/* Generated result URLs are local object URLs created from the API response. */}
+        <button type="button" className="image-preview-button" onClick={() => setLightboxImage(image)} aria-label="放大查看生成图片">
+          <img src={image.src} alt={displayPrompt(image) || "生成图片"} loading="lazy" decoding="async" />
+        </button>
+        <div className="image-overlay"><span>{image.model.replace("nai-diffusion-", "V")}</span><a href={image.src} download={image.filename}>下载原图</a></div>
+        <div className="image-card-footer">
+          <div className="image-card-actions">
+            <button type="button" className="image-reuse-button" onClick={() => reuseGeneration(image)}>再次使用提示词</button>
+            <button type="button" className={`image-favorite-button${favorite ? " active" : ""}`} onClick={() => toggleArtistThreadFavorite(image.artistPrompt)} aria-pressed={Boolean(favorite)}>{favorite ? "取消收藏" : "收藏画师串"}</button>
+            {favorite && resolvedThread && <button type="button" className="image-cover-button" onClick={() => setArtistThreadCover(resolvedThread, image.id)}>{favorite.coverImageId === image.id ? "当前封面" : "设为封面"}</button>}
+          </div>
+        </div>
+      </article>
+    );
+  }
+
+  function renderFavoriteThreadCard(thread: ArtistThread) {
+    const cover = coverForThread(thread);
+    const favorite = thread.favorite;
+    return (
+      <article className="artist-thread-card" key={thread.id}>
+        <div className="artist-thread-cover-frame">
+          <button type="button" className="artist-thread-cover" onClick={() => { setSelectedArtistThreadId(thread.id); }} aria-label={`打开${artistThreadLabel(thread.artistPrompt)}的全部图片`} data-cover-source={favorite?.coverImageId === cover?.id ? "manual" : "latest"}>
+            {cover ? <img src={cover.src} alt={artistThreadLabel(thread.artistPrompt)} loading="lazy" decoding="async" /> : <span className="artist-thread-cover-empty">暂无生成图片</span>}
+          </button>
+          <div className="artist-thread-cover-caption">
+            <h3 className="artist-thread-card-title" title={artistThreadLabel(thread.artistPrompt)}>{artistThreadLabel(thread.artistPrompt)}</h3>
+            <p>{thread.images.length ? `${thread.images.length} 张生成图片` : "暂无生成图片"}</p>
+          </div>
+        </div>
+        <div className="artist-thread-card-body">
+          <div className="artist-thread-card-actions">
+            <button type="button" className="image-reuse-button" onClick={() => setSelectedArtistThreadId(thread.id)}>查看全部图片</button>
+            <button type="button" className="image-favorite-button active" onClick={() => toggleArtistThreadFavorite(thread.artistPrompt)}>取消收藏</button>
+          </div>
+        </div>
+      </article>
+    );
+  }
+
   return (
-    <main className="app-shell">
+    <main className="app-shell" id="main-content">
+      <a className="skip-link" href="#main-content">跳到主要内容</a>
       <header className="topbar">
         <a className="brand" href="#top" aria-label="Nova Canvas 首页">
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
           <span>NOVA <b>CANVAS</b></span>
         </a>
         <div className="topbar-note"><span className="live-dot" /> API 直连 · 本机可选保存</div>
-        <a className="help-link" href="#guide">接入指南 <span>↗</span></a>
+        <a className="help-link" href="#guide">接入指南 <span aria-hidden="true" /></a>
+        <button type="button" className="favorites-nav" onClick={() => { setFavoritesOpen(true); setSelectedArtistThreadId(null); document.querySelector(".results-section")?.scrollIntoView({ behavior: "smooth", block: "start" }); }}>画师串收藏 <b>{artistFavorites.length}</b></button>
       </header>
 
       <section className="hero" id="top">
         <div>
-          <p className="eyebrow"><span>✦</span> NOVELAI IMAGE STUDIO</p>
+          <p className="eyebrow"><span aria-hidden="true" /> NOVELAI IMAGE STUDIO</p>
           <h1>把脑海里的世界，<em>画出来。</em></h1>
           <p className="hero-copy">连接 NovelAI 官方或你的中转服务，用精细参数掌控每一次创作。</p>
         </div>
@@ -524,7 +678,7 @@ export default function Home() {
                 <i className="radio-dot" />
               </button>
               <button type="button" role="radio" aria-checked={channel === "relay"} className={channel === "relay" ? "active" : ""} onClick={() => setChannel("relay")}>
-                <span className="channel-icon relay-icon">↗</span>
+                <span className="channel-icon relay-icon" aria-hidden="true">R</span>
                 <span><b>中转渠道</b><small>自定义兼容接口</small></span>
                 <i className="radio-dot" />
               </button>
@@ -532,14 +686,14 @@ export default function Home() {
             {channel === "relay" && (
               <label className="field">
                 <span>中转服务 URL <b>必填</b></span>
-                <div className="input-wrap"><span className="input-icon">⌁</span><input type="url" value={relayUrl} onChange={(event) => setRelayUrl(event.target.value)} placeholder="https://example.com/v1/images/generations" autoComplete="url" /></div>
+                <div className="input-wrap"><span className="input-icon" aria-hidden="true" /><input type="url" value={relayUrl} onChange={(event) => setRelayUrl(event.target.value)} placeholder="https://example.com/v1/images/generations" autoComplete="url" /></div>
                 <small>支持完整生成端点，也可填写以 /v1 结尾的基础地址</small>
               </label>
             )}
             <label className="field">
               <span>API Key <b>必填</b></span>
-              <div className="input-wrap"><span className="input-icon">⌘</span><input type={showKey ? "text" : "password"} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="输入你的 API Key" autoComplete="off" /><button type="button" className="key-toggle" onClick={() => setShowKey((value) => !value)} aria-label={showKey ? "隐藏密钥" : "显示密钥"}>{showKey ? "隐藏" : "显示"}</button></div>
-              <small><span className="mini-lock">◆</span> 默认仅用于当前页面；可选择只在此浏览器记住</small>
+              <div className="input-wrap"><span className="input-icon" aria-hidden="true" /><input type={showKey ? "text" : "password"} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="输入你的 API Key" autoComplete="off" /><button type="button" className="key-toggle" onClick={() => setShowKey((value) => !value)} aria-label={showKey ? "隐藏密钥" : "显示密钥"}>{showKey ? "隐藏" : "显示"}</button></div>
+              <small><span className="mini-lock" aria-hidden="true" /> 默认仅用于当前页面；可选择只在此浏览器记住</small>
             </label>
             <div className="persistence-controls">
               <div className="remember-row">
@@ -559,7 +713,7 @@ export default function Home() {
             <div className="section-heading">
               <span className="step-number">02</span>
               <div><h2>描述画面</h2><p>详细的英文提示词通常会获得更稳定的效果</p></div>
-              <button type="button" className="tag-market-trigger" onClick={() => setTagMarketOpen(true)}><span>✦</span> 标签超市</button>
+              <button type="button" className="tag-market-trigger" onClick={() => setTagMarketOpen(true)}><span aria-hidden="true" /> 标签超市</button>
             </div>
             <label className="field prompt-field artist-prompt-field">
               <span>画师串 <small>可选；会与正面提示词自动拼接</small></span>
@@ -626,32 +780,61 @@ export default function Home() {
                 <button type="button" onClick={cancelGeneration}>取消生成</button>
               </div>
             )}
-            {error && <p className="error-message">{error}</p>}
-            <button className="generate-button" type="submit" disabled={isGenerating}><span className="spark">✦</span><span>{isGenerating ? "正在生成..." : "开始生成"}<small>{isGenerating ? "请保持当前页面开启" : "预计消耗 25–32 Anlas"}</small></span><b>→</b></button>
-            <p className="privacy-note"><span>◇</span> 官方请求由浏览器直连；记录仅保存在你的设备</p>
+            {error && <p className="error-message" role="alert">{error}</p>}
+            <button className="generate-button" type="submit" disabled={isGenerating}><span className="spark" aria-hidden="true" /><span>{isGenerating ? "正在生成..." : "开始生成"}<small>{isGenerating ? "请保持当前页面开启" : "预计消耗 25–32 Anlas"}</small></span><b aria-hidden="true" /></button>
+            <p className="privacy-note"><span aria-hidden="true" /> 官方请求由浏览器直连；记录仅保存在你的设备</p>
           </section>
         </div>
       </form>
       <TagMarket open={tagMarketOpen} onClose={() => setTagMarketOpen(false)} onApply={appendTags} />
 
-      <section className="results-section" aria-labelledby="results-title">
-        <div className="results-heading"><div><p className="eyebrow"><span>✦</span> YOUR CREATIONS</p><h2 id="results-title">创作结果</h2></div><div className="results-tools"><span>{images.length ? `${images.length} 张本机作品` : "等待第一次灵感"}</span>{images.length > 0 && <button type="button" onClick={clearLocalHistory}>清空本机记录</button>}</div></div>
+      <section className="results-section" id="artist-favorites" aria-labelledby="results-title">
+        <div className="artist-favorites-toolbar">
+          <button type="button" className={`artist-favorites-toggle${favoritesOpen ? " active" : ""}`} onClick={() => { setFavoritesOpen((value) => !value); setSelectedArtistThreadId(null); }} aria-expanded={favoritesOpen}>画师串收藏 <b>{artistFavorites.length}</b></button>
+          {favoritesOpen && <span>收藏只保存画师串设置，清空图片记录不会删除收藏。</span>}
+        </div>
+        {favoritesOpen && (
+          <section className="artist-favorites-view" aria-labelledby="artist-favorites-title">
+            <div className="artist-favorites-heading"><div><p className="eyebrow"><span aria-hidden="true" /> ARTIST THREADS</p><h2 id="artist-favorites-title">画师串收藏</h2></div><span>{favoriteThreads.length} 个收藏</span></div>
+            {favoriteThreads.length === 0 ? (
+              <div className="empty-result artist-favorites-empty"><div className="empty-art"><i /><i /><span aria-hidden="true" /></div><h3>还没有收藏画师串</h3><p>在作品卡片中点击“收藏画师串”，即可集中查看该画师串的全部图片。</p></div>
+            ) : (
+              <div className="artist-thread-grid">{favoriteThreads.map((thread) => renderFavoriteThreadCard(thread))}</div>
+            )}
+            {selectedArtistThread && (
+              <section className="artist-thread-detail" aria-labelledby="artist-thread-detail-title">
+                <div className="artist-thread-detail-heading"><div><p className="eyebrow"><span aria-hidden="true" /> CURRENT THREAD</p><h3 className="artist-thread-detail-title" id="artist-thread-detail-title">{artistThreadLabel(selectedArtistThread.artistPrompt)}</h3></div><button type="button" className="image-reuse-button" onClick={() => setSelectedArtistThreadId(null)}>返回收藏列表</button></div>
+                {selectedArtistThread.images.length === 0 ? (
+                  <div className="empty-result artist-thread-empty"><h3>当前没有生成图片</h3><p>收藏仍会保留；下一次使用相同画师串生成图片后会自动归入这里。</p></div>
+                ) : (
+                  <div className="image-grid">{selectedArtistThread.images.map((image) => renderImageCard(image, selectedArtistThread))}</div>
+                )}
+              </section>
+            )}
+          </section>
+        )}
+        <div className="results-heading"><div><p className="eyebrow"><span aria-hidden="true" /> YOUR CREATIONS</p><h2 id="results-title">创作结果</h2></div><div className="results-tools"><span>{images.length ? `${images.length} 张本机作品` : "等待第一次灵感"}</span>{images.length > 0 && <button type="button" onClick={clearLocalHistory}>清空本机记录</button>}</div></div>
         {images.length === 0 ? (
-          <div className="empty-result"><div className="empty-art"><i /><i /><span>✦</span></div><h3>画布已经准备好了</h3><p>完成上方设置并开始生成，你的作品会出现在这里。</p></div>
+          <div className="empty-result"><div className="empty-art"><i /><i /><span aria-hidden="true" /></div><h3>画布已经准备好了</h3><p>完成上方设置并开始生成，你的作品会出现在这里。</p></div>
         ) : (
           <div className="image-grid">
             {images.map((image) => (
               <article className="image-card" key={image.id}>
                 {/* Generated result URLs are local object URLs created from the API response. */}
                 <button type="button" className="image-preview-button" onClick={() => setLightboxImage(image)} aria-label="放大查看生成图片">
-                  <img src={image.src} alt={displayPrompt(image) || "生成图片"} />
+                  <img src={image.src} alt={displayPrompt(image) || "生成图片"} loading="lazy" decoding="async" />
                 </button>
-                <div className="image-overlay"><span>{image.model.replace("nai-diffusion-", "V")}</span><a href={image.src} download={image.filename}>下载原图 ↓</a></div>
-                <div className="image-prompts">
-                  <p><b>画师串</b>{image.artistPrompt || "（未填写）"}</p>
-                  <p><b>正面提示词</b>{image.positivePrompt || image.prompt || "（未填写）"}</p>
-                  <p><b>负面提示词</b>{image.negativePrompt || "（未填写）"}</p>
-                  <button type="button" className="image-reuse-button" onClick={() => reuseGeneration(image)}>再次使用提示词</button>
+                <div className="image-overlay"><span>{image.model.replace("nai-diffusion-", "V")}</span><a href={image.src} download={image.filename}>下载原图</a></div>
+                <div className="image-card-footer">
+                  <div className="image-card-actions">
+                    <button type="button" className={`image-favorite-button${favoriteForThread(artistThreadKey(image.artistPrompt), image.artistPrompt) ? " active" : ""}`} onClick={() => toggleArtistThreadFavorite(image.artistPrompt)} aria-pressed={Boolean(favoriteForThread(artistThreadKey(image.artistPrompt), image.artistPrompt))}>{favoriteForThread(artistThreadKey(image.artistPrompt), image.artistPrompt) ? "取消收藏" : "收藏画师串"}</button>
+                    {(() => {
+                      const thread = artistThreads.find((candidate) => candidate.id === artistThreadKey(image.artistPrompt));
+                      const favorite = thread?.favorite;
+                      return favorite && thread ? <button type="button" className="image-cover-button" onClick={() => setArtistThreadCover(thread, image.id)}>{favorite.coverImageId === image.id ? "当前封面" : "设为封面"}</button> : null;
+                    })()}
+                    <button type="button" className="image-reuse-button" onClick={() => reuseGeneration(image)}>再次使用提示词</button>
+                  </div>
                 </div>
               </article>
             ))}
@@ -664,9 +847,18 @@ export default function Home() {
           <div className="image-lightbox-dialog" onClick={(event) => event.stopPropagation()}>
             <div className="image-lightbox-header">
               <h2 id="lightbox-title">生成图片预览</h2>
-              <button type="button" className="image-lightbox-close" onClick={() => setLightboxImage(null)} aria-label="关闭图片预览">×</button>
+              <button type="button" className="image-lightbox-close" onClick={() => setLightboxImage(null)} aria-label="关闭图片预览"><span aria-hidden="true" /></button>
             </div>
             <img className="image-lightbox-image" src={lightboxImage.src} alt={displayPrompt(lightboxImage) || "生成图片"} />
+            <dl className="image-lightbox-meta">
+              <div><dt>画师串</dt><dd>{lightboxImage.artistPrompt || "（未填写）"}</dd></div>
+              <div><dt>正面提示词</dt><dd>{lightboxImage.positivePrompt || lightboxImage.prompt || "（未填写）"}</dd></div>
+              <div><dt>负面提示词</dt><dd>{lightboxImage.negativePrompt || "（未填写）"}</dd></div>
+              <div><dt>模型</dt><dd>{lightboxImage.model}</dd></div>
+              <div><dt>尺寸</dt><dd>{lightboxImage.size}</dd></div>
+              <div><dt>生成时间</dt><dd>{lightboxImage.createdAt ? new Date(lightboxImage.createdAt).toLocaleString() : "（未知）"}</dd></div>
+              <div><dt>文件名</dt><dd>{lightboxImage.filename}</dd></div>
+            </dl>
             <div className="image-lightbox-actions">
               <button type="button" className="image-reuse-button" onClick={() => reuseGeneration(lightboxImage)}>再次使用提示词</button>
               <a href={lightboxImage.src} download={lightboxImage.filename}>下载原图</a>
@@ -676,7 +868,7 @@ export default function Home() {
       )}
 
       <section className="guide" id="guide">
-        <div><p className="eyebrow"><span>✦</span> QUICK GUIDE</p><h2>三步开始创作</h2></div>
+        <div><p className="eyebrow"><span aria-hidden="true" /> QUICK GUIDE</p><h2>三步开始创作</h2></div>
         <ol><li><b>1</b><span><strong>选择渠道</strong>官方直连，或使用兼容的中转服务。</span></li><li><b>2</b><span><strong>输入密钥</strong>Key 只参与当前请求，刷新即清除。</span></li><li><b>3</b><span><strong>描述并生成</strong>调整参数，然后等待作品完成。</span></li></ol>
       </section>
 

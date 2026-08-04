@@ -6,7 +6,7 @@ export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();
   const host = requestHeaders.get("x-forwarded-host") || requestHeaders.get("host") || "localhost:3000";
   const protocol = requestHeaders.get("x-forwarded-proto") || (host.startsWith("localhost") ? "http" : "https");
-  const image = `${protocol}://${host}/og.png`;
+  const image = `${protocol}://${host}/og-v2.png`;
 
   return {
     title: "Nova Canvas — NovelAI 图片生成工作台",
@@ -16,7 +16,7 @@ export async function generateMetadata(): Promise<Metadata> {
       title: "Nova Canvas — NovelAI 图片生成工作台",
       description: "把脑海里的世界，画出来。",
       type: "website",
-      images: [{ url: image, width: 1200, height: 630, alt: "Nova Canvas 图片生成工作台" }],
+      images: [{ url: image, width: 1734, height: 907, alt: "Nova Canvas 图片生成工作台" }],
     },
     twitter: { card: "summary_large_image", title: "Nova Canvas", description: "把脑海里的世界，画出来。", images: [image] },
   };

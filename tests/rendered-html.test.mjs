@@ -55,3 +55,77 @@ test("splits prompt history and provides an accessible image lightbox", async ()
   assert.match(persistence, /artistPrompt, positivePrompt, negativePrompt/);
   assert.match(persistence, /positivePrompt: typeof record\.positivePrompt === "string" \? record\.positivePrompt : legacyPrompt/);
 });
+
+test("omits disabled optional NovelAI parameters instead of sending invalid null values", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+
+  assert.doesNotMatch(page, /skip_cfg_above_sigma:\s*null/);
+});
+
+test("ships artist-thread favorites with durable covers and full-thread detail", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const persistence = await readFile(new URL("../app/local-persistence.ts", import.meta.url), "utf8");
+
+  assert.match(page, /artistThreadKey/);
+  assert.match(page, /loadArtistThreadFavorites/);
+  assert.match(page, /saveArtistThreadFavorites/);
+  assert.match(page, /artist-favorites-view/);
+  assert.match(page, /renderFavoriteThreadCard/);
+  assert.match(page, /data-cover-source/);
+  assert.match(page, /setArtistThreadCover/);
+  assert.match(page, /image-lightbox-meta/);
+  assert.match(page, /lightboxImage\.createdAt/);
+  assert.match(persistence, /ArtistThreadFavorite/);
+  assert.match(persistence, /artist-thread-favorites/);
+  assert.match(persistence, /normalizeArtistThreadFavorite/);
+  assert.match(persistence, /LEGACY_ARTIST_FAVORITES_SETTING/);
+});
+
+test("ships the accessible editorial UI refresh", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  const layout = await readFile(new URL("../app/layout.tsx", import.meta.url), "utf8");
+
+  assert.match(page, /className="skip-link" href="#main-content"/);
+  assert.match(page, /className="error-message" role="alert"/);
+  assert.match(page, /loading="lazy" decoding="async"/);
+  assert.match(styles, /--indigo:\s*#6366f1/);
+  assert.match(styles, /\.favorites-nav:focus-visible/);
+  assert.match(styles, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(layout, /\/og-v2\.png/);
+});
+
+test("keeps long artist threads and prompt metadata within responsive containers", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+
+  assert.match(page, /artist-thread-card-title/);
+  assert.match(page, /artist-thread-detail-title/);
+  assert.match(page, /image-card-footer/);
+  assert.doesNotMatch(page, /<p className="image-prompt-row">/);
+  assert.match(page, /lightboxImage\.positivePrompt/);
+  assert.match(page, /lightboxImage\.negativePrompt/);
+  assert.match(styles, /\.artist-thread-detail-heading > div[\s\S]*?min-width:\s*0/);
+  assert.match(styles, /\.artist-thread-detail-heading > \.image-reuse-button[\s\S]*?flex:\s*0 0 auto/);
+  assert.match(styles, /\.image-card-footer[\s\S]*?padding/);
+  assert.match(styles, /overflow-wrap:\s*anywhere/);
+  assert.match(styles, /word-break:\s*break-word/);
+  assert.match(styles, /white-space:\s*normal/);
+  assert.match(styles, /\.image-lightbox-meta dd[\s\S]*?min-width:\s*0/);
+});
+
+test("adds a readable gradient caption to artist-thread covers", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+
+  assert.match(page, /artist-thread-cover-frame/);
+  assert.match(page, /artist-thread-cover-caption/);
+  assert.match(page, /title=\{artistThreadLabel\(thread\.artistPrompt\)\}/);
+  assert.match(styles, /\.artist-thread-cover-frame::after[\s\S]*?linear-gradient/);
+  assert.match(styles, /\.artist-thread-cover-caption[\s\S]*?position:\s*absolute/);
+  assert.match(styles, /-webkit-line-clamp:\s*2/);
+  assert.match(styles, /\.artist-thread-grid\s*\{\s*grid-template-columns:\s*repeat\(2/);
+  assert.match(styles, /\.artist-thread-cover\s*\{[\s\S]*?aspect-ratio:\s*4\s*\/\s*3/);
+  assert.match(styles, /\.artist-thread-cover img\s*\{[\s\S]*?object-position:\s*center top/);
+  assert.match(styles, /\.artist-favorites-view\s+\.artist-thread-cover\s*\{\s*aspect-ratio:\s*4\s*\/\s*5/);
+});

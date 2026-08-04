@@ -12,6 +12,24 @@ export type StoredGeneration = {
   filename: string;
 };
 
+/**
+ * A saved "artist thread" is intentionally kept separate from individual
+ * generation records.  Existing databases only contain the generations and
+ * settings stores, so favourites can be added as a regular settings value
+ * without changing or deleting the existing object stores.
+ */
+export type ArtistThreadFavorite = {
+  /** Stable key derived from the normalized artist prompt. */
+  id: string;
+  artistPrompt: string;
+  /** Optional image id selected as the cover for this thread. */
+  coverImageId?: number;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type StoredArtistThreadFavorite = ArtistThreadFavorite;
+
 type LegacyStoredGeneration = Omit<Partial<StoredGeneration>, "id" | "blob" | "model" | "size" | "createdAt" | "filename"> & {
   id: number;
   blob: Blob;
@@ -41,6 +59,8 @@ const DATABASE_NAME = "nova-canvas-local";
 const DATABASE_VERSION = 1;
 const GENERATIONS_STORE = "generations";
 const SETTINGS_STORE = "settings";
+const ARTIST_THREAD_FAVORITES_SETTING = "artist-thread-favorites";
+const LEGACY_ARTIST_FAVORITES_SETTING = "artist-favorites";
 
 function openDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {
@@ -106,6 +126,61 @@ export function saveLocalSetting(key: string, value: unknown) {
 export function loadLocalSetting<T>(key: string) {
   return runRequest<T | undefined>(SETTINGS_STORE, "readonly", (store) => store.get(key));
 }
+
+/**
+ * Keep the prompt as the user entered it while deriving a stable id for
+ * grouping.  Older/hand-written settings may omit the id, so normalization
+ * fills it in rather than discarding the favourite.
+ */
+function artistThreadId(prompt: string) {
+  const normalized = prompt.trim().replace(/\s+/g, " ");
+  return normalized ? `artist:${normalized.toLocaleLowerCase()}` : "artist:untitled";
+}
+
+export function normalizeArtistThreadFavorite(value: unknown): ArtistThreadFavorite | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Partial<ArtistThreadFavorite> & { prompt?: unknown };
+  const artistPrompt = typeof record.artistPrompt === "string"
+    ? record.artistPrompt
+    : typeof record.prompt === "string"
+      ? record.prompt
+      : "";
+  if (!artistPrompt.trim() && typeof record.id !== "string") return null;
+  const id = typeof record.id === "string" && record.id.trim() ? record.id : artistThreadId(artistPrompt);
+  const coverImageId = typeof record.coverImageId === "number" && Number.isFinite(record.coverImageId)
+    ? record.coverImageId
+    : undefined;
+  return {
+    id,
+    artistPrompt,
+    ...(coverImageId === undefined ? {} : { coverImageId }),
+    ...(typeof record.createdAt === "string" ? { createdAt: record.createdAt } : {}),
+    ...(typeof record.updatedAt === "string" ? { updatedAt: record.updatedAt } : {}),
+  };
+}
+
+/** Load favourites while accepting the first key used by early builds. */
+export async function loadArtistThreadFavorites() {
+  const saved = await loadLocalSetting<unknown>(ARTIST_THREAD_FAVORITES_SETTING);
+  const legacy = saved === undefined ? await loadLocalSetting<unknown>(LEGACY_ARTIST_FAVORITES_SETTING) : undefined;
+  const value = saved ?? legacy;
+  if (!Array.isArray(value)) return [];
+  const deduped = new Map<string, ArtistThreadFavorite>();
+  for (const candidate of value) {
+    const favorite = normalizeArtistThreadFavorite(candidate);
+    if (favorite) deduped.set(favorite.id, favorite);
+  }
+  return [...deduped.values()];
+}
+
+export function saveArtistThreadFavorites(favorites: ArtistThreadFavorite[]) {
+  return saveLocalSetting(ARTIST_THREAD_FAVORITES_SETTING, favorites);
+}
+
+// Short aliases make the persistence API easy to discover for callers that
+// refer to these records simply as "artist favourites".
+export const loadArtistFavorites = loadArtistThreadFavorites;
+export const saveArtistFavorites = saveArtistThreadFavorites;
 
 export async function hasDirectoryPermission(handle: LocalDirectoryHandle, requestAccess = false) {
   if (!handle.queryPermission) return true;
