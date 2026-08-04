@@ -35,3 +35,23 @@ test("ships the complete migrated tag market catalog", async () => {
   assert.equal(catalog.datasets.reduce((total, dataset) => total + dataset.items.length, 0), 21169);
   assert.ok(catalog.datasets[0].items.some((item) => item.name === "衬衫" && item.prompt === "shirt"));
 });
+
+test("splits prompt history and provides an accessible image lightbox", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const persistence = await readFile(new URL("../app/local-persistence.ts", import.meta.url), "utf8");
+
+  assert.match(page, /artistPrompt/);
+  assert.match(page, /positivePrompt/);
+  assert.match(page, /negativePrompt/);
+  assert.match(page, /joinPromptParts/);
+  assert.match(page, /replace\(\/\^,\+\|,\+\$\/g, ""\)/);
+  assert.match(page, /const finalPrompt = joinPromptParts/);
+  assert.match(page, /finalPrompt\.length > 1800/);
+  assert.match(page, /image-lightbox/);
+  assert.match(page, /event\.key === "Escape"/);
+  assert.match(page, /reuseGeneration/);
+  assert.match(persistence, /normalizeGeneration/);
+  assert.match(persistence, /legacyPrompt/);
+  assert.match(persistence, /artistPrompt, positivePrompt, negativePrompt/);
+  assert.match(persistence, /positivePrompt: typeof record\.positivePrompt === "string" \? record\.positivePrompt : legacyPrompt/);
+});

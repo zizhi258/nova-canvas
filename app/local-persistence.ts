@@ -1,7 +1,20 @@
 export type StoredGeneration = {
   id: number;
   blob: Blob;
-  prompt: string;
+  /** Optional legacy merged prompt. New records use the three prompt fields below. */
+  prompt?: string;
+  artistPrompt: string;
+  positivePrompt: string;
+  negativePrompt: string;
+  model: string;
+  size: string;
+  createdAt: string;
+  filename: string;
+};
+
+type LegacyStoredGeneration = Omit<Partial<StoredGeneration>, "id" | "blob" | "model" | "size" | "createdAt" | "filename"> & {
+  id: number;
+  blob: Blob;
   model: string;
   size: string;
   createdAt: string;
@@ -59,8 +72,23 @@ async function runRequest<T>(storeName: string, mode: IDBTransactionMode, action
 }
 
 export async function loadGenerations() {
-  const records = await runRequest<StoredGeneration[]>(GENERATIONS_STORE, "readonly", (store) => store.getAll());
-  return records.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  const records = await runRequest<LegacyStoredGeneration[]>(GENERATIONS_STORE, "readonly", (store) => store.getAll());
+  return records.map(normalizeGeneration).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+}
+
+/**
+ * Normalizes records written before prompt fields were split. Existing records
+ * only have `prompt`; treating it as the positive prompt keeps their history
+ * visible without requiring a destructive migration.
+ */
+export function normalizeGeneration(record: LegacyStoredGeneration): StoredGeneration {
+  const legacyPrompt = typeof record.prompt === "string" ? record.prompt : "";
+  return {
+    ...record,
+    artistPrompt: typeof record.artistPrompt === "string" ? record.artistPrompt : "",
+    positivePrompt: typeof record.positivePrompt === "string" ? record.positivePrompt : legacyPrompt,
+    negativePrompt: typeof record.negativePrompt === "string" ? record.negativePrompt : "",
+  };
 }
 
 export function saveGeneration(record: StoredGeneration) {
@@ -106,11 +134,13 @@ async function writeFile(directory: LocalDirectoryHandle, filename: string, data
 function metadata(records: StoredGeneration[]) {
   return JSON.stringify(
     {
-      version: 1,
+      version: 2,
       updatedAt: new Date().toISOString(),
-      generations: records.map(({ id, prompt, model, size, createdAt, filename, blob }) => ({
+      generations: records.map(({ id, artistPrompt, positivePrompt, negativePrompt, model, size, createdAt, filename, blob }) => ({
         id,
-        prompt,
+        artistPrompt,
+        positivePrompt,
+        negativePrompt,
         model,
         size,
         createdAt,

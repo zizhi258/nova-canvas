@@ -22,7 +22,11 @@ type GeneratedImage = {
   id: number;
   src: string;
   blob: Blob;
-  prompt: string;
+  /** Optional legacy merged prompt retained when loading older records. */
+  prompt?: string;
+  artistPrompt: string;
+  positivePrompt: string;
+  negativePrompt: string;
   model: string;
   size: string;
   createdAt: string;
@@ -51,6 +55,18 @@ const progressCopy = [
 ];
 
 const OFFICIAL_ENDPOINT = "https://image.novelai.net/ai/generate-image";
+
+/** Join prompt sections while avoiding empty sections and duplicate separators. */
+function joinPromptParts(...parts: string[]) {
+  return parts
+    .map((part) => part.trim().replace(/^,+|,+$/g, "").trim())
+    .filter(Boolean)
+    .join(", ");
+}
+
+function displayPrompt(image: Pick<GeneratedImage, "artistPrompt" | "positivePrompt" | "prompt">) {
+  return joinPromptParts(image.artistPrompt, image.positivePrompt || image.prompt || "");
+}
 
 function imageType(name: string, bytes: Uint8Array) {
   const lower = name.toLowerCase();
@@ -122,7 +138,8 @@ export default function Home() {
   const [rememberKey, setRememberKey] = useState(false);
   const [keyStorageReady, setKeyStorageReady] = useState(false);
   const [relayUrl, setRelayUrl] = useState("");
-  const [prompt, setPrompt] = useState("1girl, silver hair, standing in a field of luminous flowers, starry night, cinematic lighting, intricate details");
+  const [artistPrompt, setArtistPrompt] = useState("");
+  const [positivePrompt, setPositivePrompt] = useState("1girl, silver hair, standing in a field of luminous flowers, starry night, cinematic lighting, intricate details");
   const [negativePrompt, setNegativePrompt] = useState("lowres, blurry, bad anatomy, extra fingers, watermark, text");
   const [model, setModel] = useState(models[0].value);
   const [size, setSize] = useState("832x1216");
@@ -137,10 +154,25 @@ export default function Home() {
   const [error, setError] = useState("");
   const [storageNotice, setStorageNotice] = useState("");
   const [images, setImages] = useState<GeneratedImage[]>([]);
+  const [lightboxImage, setLightboxImage] = useState<GeneratedImage | null>(null);
   const [directory, setDirectory] = useState<LocalDirectoryHandle | null>(null);
   const [directoryName, setDirectoryName] = useState("");
   const controllerRef = useRef<AbortController | null>(null);
   const objectUrlsRef = useRef<string[]>([]);
+
+  useEffect(() => {
+    if (!lightboxImage) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setLightboxImage(null);
+    };
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [lightboxImage]);
 
   const progressLabel = useMemo(
     () => [...progressCopy].reverse().find((item) => progress >= item.at)?.label ?? progressCopy[0].label,
@@ -205,8 +237,16 @@ export default function Home() {
       setError("中转渠道需要填写服务 URL。 ");
       return;
     }
-    if (!prompt.trim()) {
+    const cleanArtistPrompt = artistPrompt.trim();
+    const cleanPositivePrompt = positivePrompt.trim();
+    const finalPrompt = joinPromptParts(cleanArtistPrompt, cleanPositivePrompt);
+    const cleanNegativePrompt = negativePrompt.trim();
+    if (!finalPrompt) {
       setError("请先描述你想生成的画面。 ");
+      return;
+    }
+    if (finalPrompt.length > 1800) {
+      setError("画师串与正面提示词拼接后不能超过 1800 个字符，请删减后再生成。");
       return;
     }
 
@@ -228,7 +268,7 @@ export default function Home() {
 
       if (channel === "official") {
         const [width, height] = size.split("x").map(Number);
-        const cleanPrompt = prompt.trim();
+        const cleanPrompt = finalPrompt;
         const correlationId = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
         const isV4 = model.startsWith("nai-diffusion-4");
         const parameters = {
@@ -241,7 +281,7 @@ export default function Home() {
           n_samples: 1,
           seed: generatedSeed,
           prompt: cleanPrompt,
-          negative_prompt: negativePrompt,
+          negative_prompt: cleanNegativePrompt,
           ucPreset: 0,
           qualityToggle: true,
           sm: false,
@@ -265,7 +305,7 @@ export default function Home() {
                   legacy_uc: false,
                 },
                 v4_negative_prompt: {
-                  caption: { base_caption: negativePrompt, char_captions: [] },
+                  caption: { base_caption: cleanNegativePrompt, char_captions: [] },
                   use_coords: false,
                   use_order: false,
                   legacy_uc: false,
@@ -304,8 +344,8 @@ export default function Home() {
             channel,
             apiKey,
             relayUrl,
-            prompt,
-            negativePrompt,
+            prompt: finalPrompt,
+            negativePrompt: cleanNegativePrompt,
             model,
             size,
             steps,
@@ -326,7 +366,17 @@ export default function Home() {
       const id = Date.now();
       const createdAt = new Date().toISOString();
       const filename = filenameFor(id, blob);
-      const record: StoredGeneration = { id, blob, prompt: prompt.trim(), model, size, createdAt, filename };
+      const record: StoredGeneration = {
+        id,
+        blob,
+        artistPrompt: cleanArtistPrompt,
+        positivePrompt: cleanPositivePrompt,
+        negativePrompt: cleanNegativePrompt,
+        model,
+        size,
+        createdAt,
+        filename,
+      };
       const src = URL.createObjectURL(blob);
       objectUrlsRef.current.push(src);
       const nextImages = [{ ...record, src }, ...images];
@@ -334,10 +384,12 @@ export default function Home() {
       try {
         await saveGeneration(record);
         if (directory) {
-          const stored = nextImages.map(({ id: imageId, blob: imageBlob, prompt: imagePrompt, model: imageModel, size: imageSize, createdAt: imageCreatedAt, filename: imageFilename }) => ({
+          const stored = nextImages.map(({ id: imageId, blob: imageBlob, artistPrompt: imageArtistPrompt, positivePrompt: imagePositivePrompt, negativePrompt: imageNegativePrompt, model: imageModel, size: imageSize, createdAt: imageCreatedAt, filename: imageFilename }) => ({
             id: imageId,
             blob: imageBlob,
-            prompt: imagePrompt,
+            artistPrompt: imageArtistPrompt,
+            positivePrompt: imagePositivePrompt,
+            negativePrompt: imageNegativePrompt,
             model: imageModel,
             size: imageSize,
             createdAt: imageCreatedAt,
@@ -378,7 +430,7 @@ export default function Home() {
       const additions = value.split(",").map((item) => item.trim()).filter((item) => item && !existing.includes(item.toLowerCase()));
       return [current.trim().replace(/,\s*$/, ""), ...additions].filter(Boolean).join(", ");
     };
-    if (target === "positive") setPrompt(update);
+    if (target === "positive") setPositivePrompt(update);
     else setNegativePrompt(update);
   }
 
@@ -423,6 +475,14 @@ export default function Home() {
     } catch (reason) {
       setStorageNotice((reason as Error).message || "清空本地记录失败。 ");
     }
+  }
+
+  function reuseGeneration(image: GeneratedImage) {
+    setArtistPrompt(image.artistPrompt);
+    setPositivePrompt(image.positivePrompt || image.prompt || "");
+    setNegativePrompt(image.negativePrompt);
+    setLightboxImage(null);
+    document.querySelector(".prompt-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   return (
@@ -501,10 +561,15 @@ export default function Home() {
               <div><h2>描述画面</h2><p>详细的英文提示词通常会获得更稳定的效果</p></div>
               <button type="button" className="tag-market-trigger" onClick={() => setTagMarketOpen(true)}><span>✦</span> 标签超市</button>
             </div>
+            <label className="field prompt-field artist-prompt-field">
+              <span>画师串 <small>可选；会与正面提示词自动拼接</small></span>
+              <textarea value={artistPrompt} onChange={(event) => setArtistPrompt(event.target.value)} maxLength={1200} rows={3} placeholder="例如：masterpiece, best quality, by your favorite artist" />
+              <span className="char-count">{artistPrompt.length} / 1200</span>
+            </label>
             <label className="field prompt-field">
-              <span>正向提示词</span>
-              <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} maxLength={1800} rows={5} />
-              <span className="char-count">{prompt.length} / 1800</span>
+              <span>正面提示词</span>
+              <textarea value={positivePrompt} onChange={(event) => setPositivePrompt(event.target.value)} maxLength={1800} rows={5} />
+              <span className="char-count">{positivePrompt.length} / 1800</span>
             </label>
             <label className="field prompt-field negative-field">
               <span>反向提示词</span>
@@ -578,14 +643,37 @@ export default function Home() {
             {images.map((image) => (
               <article className="image-card" key={image.id}>
                 {/* Generated result URLs are local object URLs created from the API response. */}
-                <img src={image.src} alt={image.prompt} />
+                <button type="button" className="image-preview-button" onClick={() => setLightboxImage(image)} aria-label="放大查看生成图片">
+                  <img src={image.src} alt={displayPrompt(image) || "生成图片"} />
+                </button>
                 <div className="image-overlay"><span>{image.model.replace("nai-diffusion-", "V")}</span><a href={image.src} download={image.filename}>下载原图 ↓</a></div>
-                <p>{image.prompt}</p>
+                <div className="image-prompts">
+                  <p><b>画师串</b>{image.artistPrompt || "（未填写）"}</p>
+                  <p><b>正面提示词</b>{image.positivePrompt || image.prompt || "（未填写）"}</p>
+                  <p><b>负面提示词</b>{image.negativePrompt || "（未填写）"}</p>
+                  <button type="button" className="image-reuse-button" onClick={() => reuseGeneration(image)}>再次使用提示词</button>
+                </div>
               </article>
             ))}
           </div>
         )}
       </section>
+
+      {lightboxImage && (
+        <div className="image-lightbox" role="dialog" aria-modal="true" aria-labelledby="lightbox-title" onClick={() => setLightboxImage(null)}>
+          <div className="image-lightbox-dialog" onClick={(event) => event.stopPropagation()}>
+            <div className="image-lightbox-header">
+              <h2 id="lightbox-title">生成图片预览</h2>
+              <button type="button" className="image-lightbox-close" onClick={() => setLightboxImage(null)} aria-label="关闭图片预览">×</button>
+            </div>
+            <img className="image-lightbox-image" src={lightboxImage.src} alt={displayPrompt(lightboxImage) || "生成图片"} />
+            <div className="image-lightbox-actions">
+              <button type="button" className="image-reuse-button" onClick={() => reuseGeneration(lightboxImage)}>再次使用提示词</button>
+              <a href={lightboxImage.src} download={lightboxImage.filename}>下载原图</a>
+            </div>
+          </div>
+        </div>
+      )}
 
       <section className="guide" id="guide">
         <div><p className="eyebrow"><span>✦</span> QUICK GUIDE</p><h2>三步开始创作</h2></div>
