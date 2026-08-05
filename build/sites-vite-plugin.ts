@@ -29,7 +29,9 @@ export function sites(): Plugin {
       const hostingConfig = resolve(root, ".openai", "hosting.json");
       const drizzleSource = resolve(root, "drizzle");
 
-      await rm(outputDirectory, { recursive: true, force: true });
+      // Best-effort clean: some sandboxes intercept fs.rm with a trash shim
+      // that can fail; cp below overwrites the payload files anyway.
+      await rm(outputDirectory, { recursive: true, force: true }).catch(() => undefined);
       await mkdir(outputDirectory, { recursive: true });
 
       if (await exists(hostingConfig)) {

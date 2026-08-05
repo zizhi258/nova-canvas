@@ -10,6 +10,12 @@ export type StoredGeneration = {
   size: string;
   createdAt: string;
   filename: string;
+  /** Generation parameters captured at enqueue time (absent on older records). */
+  seed?: number;
+  steps?: number;
+  scale?: number;
+  sampler?: string;
+  durationMs?: number;
 };
 
 /**
