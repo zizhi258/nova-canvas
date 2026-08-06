@@ -309,9 +309,9 @@ a { color: inherit; text-decoration: none; }
 .view-tabs button.active { color: var(--purple); background: #fff; box-shadow: 0 2px 8px rgba(42, 31, 63, 0.08); }
 .view-tabs button b { margin-left: 4px; font-size: 11px; }
 
-.canvas-tools { display: flex; align-items: center; gap: 10px; }
+.canvas-tools { min-width: 0; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
 .canvas-tools span { color: var(--muted); font-size: 12px; }
-.canvas-tools button { background: #fff; }
+.canvas-tools button { max-width: 100%; background: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ---------- Generation queue strip ---------- */
 
@@ -358,8 +358,22 @@ a { color: inherit; text-decoration: none; }
 .empty-steps strong { display: block; margin-bottom: 3px; color: var(--ink); font-size: 12px; }
 .empty-steps li span { color: var(--muted); font-size: 12px; line-height: 1.5; }
 
-.image-grid { min-width: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 16px; }
-.image-card { min-width: 0; margin: 0; position: relative; border: 1px solid var(--line); border-radius: 14px; background: #fff; overflow: hidden; box-shadow: var(--shadow-sm); animation: nova-rise 0.4s ease both; transition: transform 0.25s ease, box-shadow 0.25s ease; }
+.image-grid { min-width: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 210px), 1fr)); gap: 16px; }
+.image-card {
+  min-width: 0;
+  margin: 0;
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+  /* Keep a large history from forcing layout/paint for every off-screen card. */
+  content-visibility: auto;
+  contain-intrinsic-size: 320px 350px;
+  animation: nova-rise 0.4s ease both;
+  transition: transform 0.25s ease, box-shadow 0.25s ease;
+}
 .image-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-md); }
 @keyframes nova-rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 .image-preview-button { width: 100%; display: block; padding: 0; border: 0; background: #f1eaff; cursor: zoom-in; overflow: hidden; }
@@ -372,8 +386,11 @@ a { color: inherit; text-decoration: none; }
 .image-overlay a:hover { background: rgba(27, 22, 35, 0.85); }
 .image-overlay a::after { content: ""; width: 6px; height: 6px; display: inline-block; margin-left: 7px; border-top: 1.5px solid currentColor; border-right: 1.5px solid currentColor; transform: rotate(45deg); vertical-align: 0; }
 .image-card-footer { min-width: 0; padding: 11px 12px 12px; }
-.image-card-actions { display: flex; flex-wrap: wrap; gap: 7px; }
-.image-reuse-button, .image-favorite-button, .image-cover-button { min-height: 32px; padding: 0 10px; border-radius: 8px; font-size: 12px; font-weight: 750; cursor: pointer; transition: border-color 0.18s ease, background 0.18s ease, color 0.18s ease; }
+.image-card-actions { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.image-reuse-button, .image-favorite-button, .image-cover-button { min-width: 0; min-height: 34px; padding: 0 8px; border-radius: 8px; font-size: 12px; font-weight: 750; cursor: pointer; transition: border-color 0.18s ease, background 0.18s ease, color 0.18s ease; }
+.image-card-actions > button { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.image-card-actions > .image-reuse-button:last-child,
+.image-card-actions > .image-reuse-button:first-child:only-child { grid-column: 1 / -1; }
 .image-reuse-button { border: 1px solid #d8c7f6; color: var(--purple-dark); background: #fff; }
 .image-reuse-button:hover { border-color: var(--purple); background: var(--purple-soft); }
 .image-reuse-button:disabled { cursor: default; opacity: 0.45; }
@@ -389,7 +406,7 @@ a { color: inherit; text-decoration: none; }
 .artist-favorites-heading > span { color: var(--muted); font-size: 12px; }
 
 .artist-thread-grid { min-width: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; }
-.artist-thread-card { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 13px; background: #fff; box-shadow: var(--shadow-sm); transition: transform 0.25s ease, box-shadow 0.25s ease; }
+.artist-thread-card { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 13px; background: #fff; box-shadow: var(--shadow-sm); content-visibility: auto; contain-intrinsic-size: 320px 310px; transition: transform 0.25s ease, box-shadow 0.25s ease; }
 .artist-thread-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-md); }
 
 /* Cover frame keeps labels readable on bright and dark artwork without
@@ -430,7 +447,8 @@ a { color: inherit; text-decoration: none; }
 .artist-thread-card-body { min-width: 0; padding: 11px 13px 13px; }
 .artist-thread-card-body h3, .artist-thread-card-body .artist-thread-card-title { margin: 0 0 6px; color: var(--ink); font-size: 14px; overflow: visible; text-overflow: clip; }
 .artist-thread-card-body p { margin: 0; color: var(--muted); font-size: 12px; }
-.artist-thread-card-actions { display: flex; flex-wrap: wrap; gap: 7px; padding-top: 11px; }
+.artist-thread-card-actions { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; padding-top: 11px; }
+.artist-thread-card-actions > button { width: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .artist-thread-detail { min-width: 0; margin-top: 26px; padding: 16px 18px 18px; border: 1px solid var(--line); border-radius: 14px; background: #fff; box-shadow: var(--shadow-sm); }
 .artist-thread-detail-heading { align-items: flex-start; }

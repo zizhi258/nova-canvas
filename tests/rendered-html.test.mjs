@@ -95,6 +95,15 @@ test("ships the accessible editorial UI refresh", async () => {
   assert.match(layout, /\/og-v2\.png/);
 });
 
+test("defers off-screen image cards and keeps card actions in a stable grid", async () => {
+  const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+
+  assert.match(styles, /\.image-card\s*\{[\s\S]*?content-visibility:\s*auto/);
+  assert.match(styles, /\.image-card\s*\{[\s\S]*?contain-intrinsic-size:\s*320px 350px/);
+  assert.match(styles, /\.image-card-actions\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
+  assert.match(styles, /\.image-card-actions\s*>\s*\.image-reuse-button:last-child/);
+});
+
 test("keeps long artist threads and prompt metadata within responsive containers", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");

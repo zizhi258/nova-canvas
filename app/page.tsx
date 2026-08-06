@@ -795,9 +795,9 @@ export default function Home() {
         <div className="image-overlay"><span>{image.model.replace("nai-diffusion-", "V")}</span><a href={image.src} download={image.filename}>下载原图</a></div>
         <div className="image-card-footer">
           <div className="image-card-actions">
-            <button type="button" className="image-reuse-button" onClick={() => reuseGeneration(image)}>再次使用提示词</button>
             <button type="button" className={`image-favorite-button${favorite ? " active" : ""}`} onClick={() => toggleArtistThreadFavorite(image.artistPrompt)} aria-pressed={Boolean(favorite)}>{favorite ? "取消收藏" : "收藏画师串"}</button>
             {favorite && resolvedThread && <button type="button" className="image-cover-button" onClick={() => setArtistThreadCover(resolvedThread, image.id)}>{favorite.coverImageId === image.id ? "当前封面" : "设为封面"}</button>}
+            <button type="button" className="image-reuse-button" onClick={() => reuseGeneration(image)}>再次使用提示词</button>
           </div>
         </div>
       </article>
