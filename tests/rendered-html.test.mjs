@@ -95,11 +95,24 @@ test("ships the accessible editorial UI refresh", async () => {
   assert.match(layout, /\/og-v2\.png/);
 });
 
-test("defers off-screen image cards and keeps card actions in a stable grid", async () => {
+test("uses persisted WebP previews and keeps image cards cheap and stable", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const persistence = await readFile(new URL("../app/local-persistence.ts", import.meta.url), "utf8");
   const styles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
 
-  assert.match(styles, /\.image-card\s*\{[\s\S]*?content-visibility:\s*auto/);
-  assert.match(styles, /\.image-card\s*\{[\s\S]*?contain-intrinsic-size:\s*320px 350px/);
+  assert.match(page, /thumbnailSrc/);
+  assert.match(page, /readGenerationPreview/);
+  assert.match(page, /createThumbnailBlob/);
+  assert.match(persistence, /THUMBNAIL_MAX_DIMENSION\s*=\s*384/);
+  assert.match(persistence, /thumbnailFilenameFor/);
+  assert.match(persistence, /writeGenerationThumbnail/);
+  assert.doesNotMatch(styles, /\.image-card\s*\{[^}]*\bcontent-visibility\s*:/);
+  assert.doesNotMatch(styles, /\.image-card\s*\{[^}]*\bcontain-intrinsic-size\s*:/);
+  assert.doesNotMatch(styles, /\.image-card\s*\{[^}]*\banimation\s*:/);
+  assert.doesNotMatch(styles, /\.image-card:hover/);
+  assert.doesNotMatch(styles, /\.image-card img\s*\{[^}]*\btransform\s*:/);
+  assert.doesNotMatch(styles, /\.image-overlay span,\s*\.image-download-button\s*\{[^}]*backdrop-filter\s*:/);
+  assert.match(styles, /\.image-overlay span,\s*\.image-download-button\s*\{[^}]*background:\s*rgba\(27, 22, 35, 0\.9\)/);
   assert.match(styles, /\.image-card-actions\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
   assert.match(styles, /\.image-card-actions\s*>\s*\.image-reuse-button:last-child/);
 });

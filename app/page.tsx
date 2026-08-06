@@ -4,27 +4,43 @@ import { unzipSync } from "fflate";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   clearGenerations,
-  exportAllToFolder,
+  countLegacyBlobs,
+  createThumbnailBlob,
   filenameFor,
   hasDirectoryPermission,
+  isFileSystemAccessSupported,
   loadGenerations,
   loadArtistThreadFavorites,
+  loadLegacyBlobs,
   loadLocalSetting,
   LocalDirectoryHandle,
+  migrateLegacyBlob,
+  readGenerationBlob,
+  readGenerationPreview,
   saveGeneration,
   saveArtistThreadFavorites,
   saveLocalSetting,
+  syncGenerationFolder,
+  writeGenerationImage,
+  writeGenerationThumbnail,
   ArtistThreadFavorite,
   StoredGeneration,
-  syncGenerationFolder,
 } from "./local-persistence";
 import TagMarket from "./tag-market";
 
 type Channel = "official" | "relay";
+
+/**
+ * In-memory view of a generation. The image binary lives only in the local
+ * folder; card previews are filled lazily (on screen) by `LazyImage`, while the
+ * lightbox/download path reads the original on demand. The metadata list stays
+ * tiny and can hold thousands of entries.
+ */
 type GeneratedImage = {
   id: number;
-  src: string;
-  blob: Blob;
+  src?: string;
+  /** In-memory WebP sidecar URL used by cards; lightbox still reads `src`/original. */
+  thumbnailSrc?: string;
   /** Optional legacy merged prompt retained when loading older records. */
   prompt?: string;
   artistPrompt: string;
@@ -39,6 +55,8 @@ type GeneratedImage = {
   scale?: number;
   sampler?: string;
   durationMs?: number;
+  mimeType?: string;
+  migrated?: boolean;
 };
 
 /** Immutable snapshot of everything a queued generation task needs. */
@@ -73,6 +91,8 @@ type GenTask = {
 const MAX_CONCURRENT_TASKS = 2;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const RATE_LIMIT_RETRY_DELAY_MS = 6000;
+/** How many image cards to render before switching to lazy/paginated loading. */
+const PAGE_SIZE = 60;
 
 type ArtistThread = {
   id: string;
@@ -114,10 +134,6 @@ function joinPromptParts(...parts: string[]) {
     .map((part) => part.trim().replace(/^,+|,+$/g, "").trim())
     .filter(Boolean)
     .join(", ");
-}
-
-function displayPrompt(image: Pick<GeneratedImage, "artistPrompt" | "positivePrompt" | "prompt">) {
-  return joinPromptParts(image.artistPrompt, image.positivePrompt || image.prompt || "");
 }
 
 function normalizedArtistPrompt(value: string) {
@@ -217,6 +233,168 @@ async function officialImage(response: Response) {
   }
 }
 
+/**
+ * Loads an image binary from the authorized folder on demand and exposes it as
+ * a blob URL while the card is mounted. Folder-backed URLs are revoked when
+ * their cards unmount. Fresh generations carry only a small in-memory thumbnail
+ * URL, so card rendering skips a disk read without retaining full originals.
+ */
+const previewRequestCache = new WeakMap<object, Map<string, Promise<Awaited<ReturnType<typeof readGenerationPreview>>>>>();
+
+function loadGenerationPreview(directory: LocalDirectoryHandle, filename: string) {
+  let requests = previewRequestCache.get(directory);
+  if (!requests) {
+    requests = new Map();
+    previewRequestCache.set(directory, requests);
+  }
+  const existing = requests.get(filename);
+  if (existing) return existing;
+  const request = readGenerationPreview(directory, filename);
+  requests.set(filename, request);
+  request.then(
+    () => requests?.delete(filename),
+    () => requests?.delete(filename),
+  );
+  return request;
+}
+
+function LazyImage({
+  image,
+  directory,
+  alt,
+  className,
+}: {
+  image: GeneratedImage;
+  directory: LocalDirectoryHandle | null;
+  alt: string;
+  className?: string;
+}) {
+  // Fresh generations may carry a thumbnail URL; historical records start
+  // undefined and are filled on screen from the folder's WebP sidecar.
+  const [src, setSrc] = useState<string | undefined>(image.thumbnailSrc || image.src);
+  const [failed, setFailed] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+  const urlRef = useRef<string | undefined>(undefined);
+  const revokeTimerRef = useRef<number | undefined>(undefined);
+  const sourceKindRef = useRef<"thumbnail" | "original" | "inline" | "unknown">(
+    image.thumbnailSrc ? "thumbnail" : image.src ? "inline" : "unknown",
+  );
+  const fallbackTriedRef = useRef(false);
+
+  const releaseUrlNow = () => {
+    if (revokeTimerRef.current !== undefined) {
+      window.clearTimeout(revokeTimerRef.current);
+      revokeTimerRef.current = undefined;
+    }
+    if (urlRef.current) {
+      URL.revokeObjectURL(urlRef.current);
+      urlRef.current = undefined;
+    }
+  };
+
+  const scheduleUrlRelease = () => {
+    const url = urlRef.current;
+    if (!url) return;
+    if (revokeTimerRef.current !== undefined) window.clearTimeout(revokeTimerRef.current);
+    revokeTimerRef.current = window.setTimeout(() => {
+      if (urlRef.current === url) {
+        URL.revokeObjectURL(url);
+        urlRef.current = undefined;
+      }
+      revokeTimerRef.current = undefined;
+    }, 0);
+  };
+
+  useEffect(() => {
+    if (revokeTimerRef.current !== undefined) {
+      window.clearTimeout(revokeTimerRef.current);
+      revokeTimerRef.current = undefined;
+    }
+    if (src) {
+      // Keep a cleanup on the settled-src branch too; otherwise the effect
+      // that created a folder-backed URL would be replaced without an
+      // unmount cleanup when `src` changes from undefined to the blob URL.
+      return () => scheduleUrlRelease();
+    }
+    if (!directory) return;
+    let cancelled = false;
+    const node = ref.current;
+    const reveal = () => {
+      if (cancelled || urlRef.current || fallbackTriedRef.current) return;
+      void loadGenerationPreview(directory, image.filename)
+        .then(({ blob, thumbnail }) => {
+          if (cancelled) return;
+          const url = URL.createObjectURL(blob);
+          urlRef.current = url;
+          sourceKindRef.current = thumbnail ? "thumbnail" : "original";
+          setSrc(url);
+          setFailed(false);
+        })
+        .catch(() => {
+          if (!cancelled) setFailed(true);
+        });
+    };
+    if (!node || typeof IntersectionObserver === "undefined") {
+      reveal();
+      return () => {
+        cancelled = true;
+        scheduleUrlRelease();
+      };
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) reveal();
+        }
+      },
+      { rootMargin: "300px" },
+    );
+    observer.observe(node);
+    return () => {
+      // Release folder-backed URLs when a card leaves the tree; the delayed
+      // revoke keeps React StrictMode's development remount from breaking src.
+      cancelled = true;
+      observer.disconnect();
+      // Delay one tick so React StrictMode's development remount can cancel
+      // the revoke before the still-mounted image URL is invalidated.
+      scheduleUrlRelease();
+    };
+  }, [src, directory, image.id, image.filename]);
+
+  function handleImageError() {
+    if (sourceKindRef.current === "thumbnail" && directory && !fallbackTriedRef.current) {
+      fallbackTriedRef.current = true;
+      releaseUrlNow();
+      setSrc(undefined);
+      void readGenerationBlob(directory, image.filename)
+        .then((blob) => {
+          const url = URL.createObjectURL(blob);
+          urlRef.current = url;
+          sourceKindRef.current = "original";
+          setSrc(url);
+          setFailed(false);
+        })
+        .catch(() => setFailed(true));
+      return;
+    }
+    setFailed(true);
+  }
+
+  return (
+    <div className="lazy-image" ref={ref} style={{ minHeight: 220 }}>
+      {failed ? (
+        <span className="lazy-image-empty">图片文件未找到，可能需要迁移旧数据</span>
+      ) : src ? (
+        // onError unmounts the img so the browser never falls back to displaying
+        // a long alt string as a broken-image placeholder.
+        <img src={src} alt={alt || "生成图片"} loading="lazy" decoding="async" className={className} onError={handleImageError} />
+      ) : (
+        <span className="lazy-image-placeholder" aria-hidden="true" />
+      )}
+    </div>
+  );
+}
+
 export default function Home() {
   const [channel, setChannel] = useState<Channel>("official");
   const [apiKey, setApiKey] = useState("");
@@ -241,24 +419,38 @@ export default function Home() {
   const [storageNotice, setStorageNotice] = useState("");
   const [images, setImages] = useState<GeneratedImage[]>([]);
   const [lightboxImage, setLightboxImage] = useState<GeneratedImage | null>(null);
+  const [lightboxSrc, setLightboxSrc] = useState<string | undefined>(undefined);
   const [copiedSection, setCopiedSection] = useState<"prompt" | "negative" | "artist" | "thread" | null>(null);
+  const [lightboxZoom, setLightboxZoom] = useState(1);
+  const [lightboxPan, setLightboxPan] = useState({ x: 0, y: 0 });
+  const lightboxStageRef = useRef<HTMLDivElement | null>(null);
+  const lightboxDragRef = useRef<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null);
   const [artistFavorites, setArtistFavorites] = useState<ArtistThreadFavorite[]>([]);
   const [mainView, setMainView] = useState<"results" | "favorites">("results");
   const [connectionOpen, setConnectionOpen] = useState(true);
   const [selectedArtistThreadId, setSelectedArtistThreadId] = useState<string | null>(null);
   const [directory, setDirectory] = useState<LocalDirectoryHandle | null>(null);
   const [directoryName, setDirectoryName] = useState("");
+  const [fsSupported, setFsSupported] = useState(true);
+  const [legacyCount, setLegacyCount] = useState(0);
+  const [migrationState, setMigrationState] = useState<{ running: boolean; done: number; total: number } | null>(null);
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const controllersRef = useRef(new Map<number, AbortController>());
   // Synchronous concurrency gate: state updates are async, so the number of
   // in-flight tasks is tracked in a ref to stay correct even when effects fire
   // twice (StrictMode) or several tasks are enqueued in one render.
   const runningCountRef = useRef(0);
-  const objectUrlsRef = useRef<string[]>([]);
+  const freshThumbnailUrlsRef = useRef<Map<number, string>>(new Map());
   const imagesRef = useRef<GeneratedImage[]>([]);
+  const directoryRef = useRef<LocalDirectoryHandle | null>(null);
 
   useEffect(() => {
     imagesRef.current = images;
   }, [images]);
+
+  useEffect(() => {
+    directoryRef.current = directory;
+  }, [directory]);
 
   const stepLightbox = useCallback((offset: number) => {
     setCopiedSection(null);
@@ -285,6 +477,96 @@ export default function Home() {
       document.removeEventListener("keydown", handleKeyDown);
     };
   }, [lightboxImage, stepLightbox]);
+
+  // Load the image binary for the currently open lightbox image on demand.
+  // setState calls are deferred to microtasks to avoid cascading renders.
+  useEffect(() => {
+    if (!lightboxImage) return;
+    let revoked = false;
+    let createdUrl: string | undefined;
+    const apply = (url: string | undefined) => {
+      if (!revoked) void Promise.resolve().then(() => setLightboxSrc(url));
+    };
+    // Freshly generated images carry their blob URL on the record already.
+    if (lightboxImage.src) {
+      apply(lightboxImage.src);
+      return () => {
+        revoked = true;
+      };
+    }
+    const dir = directoryRef.current;
+    if (!dir) {
+      apply(undefined);
+      return () => {
+        revoked = true;
+      };
+    }
+    apply(undefined);
+    void readGenerationBlob(dir, lightboxImage.filename)
+      .then((blob) => {
+        if (revoked) return;
+        createdUrl = URL.createObjectURL(blob);
+        setLightboxSrc(createdUrl);
+      })
+      .catch(() => {
+        if (!revoked) setLightboxSrc(undefined);
+      });
+    return () => {
+      revoked = true;
+      if (createdUrl) URL.revokeObjectURL(createdUrl);
+    };
+  }, [lightboxImage]);
+
+  // Zoom resets whenever another image is opened or stepped to.
+  useEffect(() => {
+    setLightboxZoom(1);
+    setLightboxPan({ x: 0, y: 0 });
+  }, [lightboxImage?.id]);
+
+  // Wheel zoom needs a non-passive listener, otherwise preventDefault is ignored.
+  useEffect(() => {
+    const stage = lightboxStageRef.current;
+    if (!stage || !lightboxImage) return;
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      setLightboxZoom((value) => {
+        const next = Math.min(4, Math.max(1, Math.round((value + (event.deltaY < 0 ? 0.25 : -0.25)) * 100) / 100));
+        if (next === 1) setLightboxPan({ x: 0, y: 0 });
+        return next;
+      });
+    };
+    stage.addEventListener("wheel", onWheel, { passive: false });
+    return () => stage.removeEventListener("wheel", onWheel);
+  }, [lightboxImage]);
+
+  function adjustLightboxZoom(delta: number) {
+    setLightboxZoom((value) => {
+      const next = Math.min(4, Math.max(1, Math.round((value + delta) * 100) / 100));
+      if (next === 1) setLightboxPan({ x: 0, y: 0 });
+      return next;
+    });
+  }
+
+  function resetLightboxZoom() {
+    setLightboxZoom(1);
+    setLightboxPan({ x: 0, y: 0 });
+  }
+
+  function onLightboxPointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (lightboxZoom <= 1) return;
+    lightboxDragRef.current = { startX: event.clientX, startY: event.clientY, baseX: lightboxPan.x, baseY: lightboxPan.y };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function onLightboxPointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    const drag = lightboxDragRef.current;
+    if (!drag) return;
+    setLightboxPan({ x: drag.baseX + event.clientX - drag.startX, y: drag.baseY + event.clientY - drag.startY });
+  }
+
+  function onLightboxPointerUp() {
+    lightboxDragRef.current = null;
+  }
 
   const activeTask = tasks.find((task) => task.status === "running") || null;
   const pendingTaskCount = tasks.filter((task) => task.status === "pending").length;
@@ -322,10 +604,12 @@ export default function Home() {
 
   useEffect(() => {
     let active = true;
-    const trackedUrls = objectUrlsRef.current;
     const controllers = controllersRef.current;
+    const freshThumbnailUrls = freshThumbnailUrlsRef.current;
+
     void Promise.resolve().then(() => {
       if (!active) return;
+      setFsSupported(isFileSystemAccessSupported());
       const savedKey = window.localStorage.getItem("nova-canvas:api-key");
       const shouldRemember = window.localStorage.getItem("nova-canvas:remember-key") === "true";
       if (shouldRemember && savedKey) {
@@ -336,16 +620,12 @@ export default function Home() {
       setKeyStorageReady(true);
     });
 
+    // Metadata only — no blobs are read into memory here, so this is fast and
+    // light even with thousands of records.
     void loadGenerations()
       .then((records) => {
         if (!active) return;
-        setImages(
-          records.map((record) => {
-            const src = URL.createObjectURL(record.blob);
-            objectUrlsRef.current.push(src);
-            return { ...record, src };
-          }),
-        );
+        setImages(records);
       })
       .catch(() => active && setStorageNotice("浏览器未能读取之前保存的生成记录。 "));
 
@@ -363,10 +643,17 @@ export default function Home() {
       })
       .catch(() => undefined);
 
+    void countLegacyBlobs()
+      .then((count) => {
+        if (active) setLegacyCount(count);
+      })
+      .catch(() => undefined);
+
     return () => {
       active = false;
       controllers.forEach((controller) => controller.abort());
-      trackedUrls.forEach((url) => URL.revokeObjectURL(url));
+      freshThumbnailUrls.forEach((url) => URL.revokeObjectURL(url));
+      freshThumbnailUrls.clear();
     };
   }, []);
 
@@ -380,6 +667,15 @@ export default function Home() {
   function enqueueGeneration(event: FormEvent) {
     event.preventDefault();
     setFormError("");
+    if (!fsSupported) {
+      setFormError("当前浏览器不支持本地文件夹存储，请使用桌面版 Chrome 或 Edge。 ");
+      return;
+    }
+    if (!directory) {
+      setFormError("请先在「连接服务」中选择用于保存图片的本地文件夹。 ");
+      setConnectionOpen(true);
+      return;
+    }
     if (!apiKey.trim()) {
       setFormError("请输入 API Key 后再开始生成。密钥仅用于本次请求。 ");
       setConnectionOpen(true);
@@ -556,9 +852,22 @@ export default function Home() {
       const id = Date.now();
       const createdAt = new Date().toISOString();
       const filename = filenameFor(id, blob);
+      const targetDirectory = directoryRef.current;
+      if (!targetDirectory) throw new Error("未选择本地文件夹，无法保存图片。 ");
+      // Write the image binary to the folder first; only persist metadata to
+      // IndexedDB once the file is safely on disk.
+      await writeGenerationImage(targetDirectory, filename, blob);
+      let thumbnailBlob: Blob | null = null;
+      try {
+        thumbnailBlob = await createThumbnailBlob(blob);
+        if (thumbnailBlob) await writeGenerationThumbnail(targetDirectory, filename, thumbnailBlob);
+      } catch {
+        // The original remains the source of truth when thumbnail generation
+        // or sidecar writing is unavailable.
+        thumbnailBlob = null;
+      }
       const record: StoredGeneration = {
         id,
-        blob,
         artistPrompt: params.artistPrompt,
         positivePrompt: params.positivePrompt,
         negativePrompt: params.negativePrompt,
@@ -571,24 +880,24 @@ export default function Home() {
         scale: params.scale,
         sampler: params.sampler,
         durationMs,
+        mimeType: blob.type,
+        migrated: true,
       };
-      const src = URL.createObjectURL(blob);
-      objectUrlsRef.current.push(src);
-      const nextImages = [{ ...record, src }, ...imagesRef.current];
+      // Keep only the small card preview in memory. Lightbox/download read the
+      // original from the authorized folder on demand.
+      const freshThumbnailSrc = thumbnailBlob ? URL.createObjectURL(thumbnailBlob) : undefined;
+      if (freshThumbnailSrc) freshThumbnailUrlsRef.current.set(id, freshThumbnailSrc);
+      const nextImages = [
+        { ...record, ...(freshThumbnailSrc ? { thumbnailSrc: freshThumbnailSrc } : {}) },
+        ...imagesRef.current,
+      ];
       imagesRef.current = nextImages;
       setImages(nextImages);
+      setVisibleCount((current) => Math.max(current, PAGE_SIZE));
       try {
         await saveGeneration(record);
-        if (directory) {
-          const stored = nextImages.map(({ src, ...rest }) => {
-            void src;
-            return rest;
-          });
-          await syncGenerationFolder(directory, stored, record);
-          setStorageNotice(`图片已保存到浏览器和“${directory.name}”文件夹。`);
-        } else {
-          setStorageNotice("图片已保存在当前浏览器；选择本地文件夹后可同步图片与 JSON。 ");
-        }
+        await syncGenerationFolder(targetDirectory, nextImages);
+        setStorageNotice(`图片已保存到“${targetDirectory.name}”文件夹。`);
       } catch (storageError) {
         setStorageNotice((storageError as Error).message || "图片已生成，但本地持久化失败。 ");
       }
@@ -653,7 +962,6 @@ export default function Home() {
       runningCountRef.current += 1;
       void runTask(task);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tasks]);
 
   /** Toggle a tag's prompt text inside the target prompt: present → remove, absent → append. */
@@ -686,30 +994,81 @@ export default function Home() {
       showDirectoryPicker?: (options?: { mode?: "readwrite" }) => Promise<LocalDirectoryHandle>;
     }).showDirectoryPicker;
     if (!picker) {
-      setStorageNotice("当前浏览器不支持文件夹写入；图片仍会保存在浏览器本地数据库中。 ");
+      setStorageNotice("当前浏览器不支持文件夹写入，请使用桌面版 Chrome 或 Edge。 ");
       return;
     }
     try {
       const selected = await picker({ mode: "readwrite" });
       if (!(await hasDirectoryPermission(selected, true))) throw new Error("没有获得文件夹写入权限。 ");
-      const records = await loadGenerations();
-      await exportAllToFolder(selected, records);
       await saveLocalSetting("directory", selected);
       setDirectory(selected);
       setDirectoryName(selected.name);
-      setStorageNotice(`已连接“${selected.name}”，现有图片和 nova-canvas.json 已同步。`);
+      // Refresh the folder index file so it reflects the current metadata.
+      const records = await loadGenerations();
+      await syncGenerationFolder(selected, records);
+      const legacy = await countLegacyBlobs();
+      setLegacyCount(legacy);
+      if (legacy > 0) {
+        setStorageNotice(`已连接“${selected.name}”。检测到 ${legacy} 条旧记录仍保存在浏览器中，点击「迁移旧数据」可导入到文件夹。`);
+      } else {
+        setStorageNotice(`已连接“${selected.name}”，新作品会直接保存到此文件夹。`);
+      }
     } catch (reason) {
       if ((reason as Error).name !== "AbortError") setStorageNotice((reason as Error).message || "无法连接本地文件夹。 ");
     }
   }
 
+  /** Move legacy IndexedDB blobs into the authorized folder and strip them. */
+  async function migrateLegacyData() {
+    const targetDirectory = directoryRef.current;
+    if (!targetDirectory) {
+      setStorageNotice("请先选择本地文件夹后再迁移。 ");
+      return;
+    }
+    if (migrationState?.running) return;
+    try {
+      const entries = await loadLegacyBlobs();
+      if (entries.length === 0) {
+        setLegacyCount(0);
+        setStorageNotice("没有需要迁移的旧数据。 ");
+        return;
+      }
+      setMigrationState({ running: true, done: 0, total: entries.length });
+      let done = 0;
+      let failed = 0;
+      for (const entry of entries) {
+        try {
+          await migrateLegacyBlob(targetDirectory, entry);
+        } catch {
+          failed += 1;
+        }
+        done += 1;
+        setMigrationState({ running: true, done, total: entries.length });
+      }
+      const records = await loadGenerations();
+      setImages(records);
+      await syncGenerationFolder(targetDirectory, records);
+      const remaining = await countLegacyBlobs();
+      setLegacyCount(remaining);
+      setMigrationState(null);
+      setStorageNotice(`迁移完成：${done - failed} 张已导入文件夹${failed ? `，${failed} 张失败` : ""}。`);
+    } catch (reason) {
+      setMigrationState(null);
+      setStorageNotice((reason as Error).message || "迁移旧数据失败。 ");
+    }
+  }
+
   async function clearLocalHistory() {
-    if (!window.confirm("确定清空当前浏览器中的生成记录吗？已同步到文件夹的图片文件不会被删除。")) return;
+    if (!window.confirm("确定清空浏览器中的生成记录吗？本地文件夹里的图片文件不会被删除。")) return;
     try {
       await clearGenerations();
-      images.forEach((image) => URL.revokeObjectURL(image.src));
+      const freshThumbnailUrls = freshThumbnailUrlsRef.current;
+      freshThumbnailUrls.forEach((url) => URL.revokeObjectURL(url));
+      freshThumbnailUrls.clear();
       setImages([]);
-      if (directory) await syncGenerationFolder(directory, []);
+      setVisibleCount(PAGE_SIZE);
+      const targetDirectory = directoryRef.current;
+      if (targetDirectory) await syncGenerationFolder(targetDirectory, []);
       setStorageNotice("浏览器生成记录已清空；本地文件夹中的图片文件保持不变。 ");
     } catch (reason) {
       setStorageNotice((reason as Error).message || "清空本地记录失败。 ");
@@ -722,6 +1081,34 @@ export default function Home() {
     setNegativePrompt(image.negativePrompt);
     setLightboxImage(null);
     if (mainView !== "results") setMainView("results");
+  }
+
+  function triggerDownload(url: string, filename: string) {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  }
+
+  /** Download an image on demand from the original file in the local folder. */
+  async function downloadImage(image: GeneratedImage) {
+    const fresh = image.src;
+    if (fresh) {
+      triggerDownload(fresh, image.filename);
+      return;
+    }
+    const dir = directoryRef.current;
+    if (!dir) return;
+    try {
+      const blob = await readGenerationBlob(dir, image.filename);
+      const url = URL.createObjectURL(blob);
+      triggerDownload(url, image.filename);
+      window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+    } catch {
+      setStorageNotice("无法读取图片文件，可能需要先迁移旧数据。 ");
+    }
   }
 
   const lightboxIndex = lightboxImage ? images.findIndex((image) => image.id === lightboxImage.id) : -1;
@@ -788,11 +1175,11 @@ export default function Home() {
     const favorite = resolvedThread?.favorite;
     return (
       <article className="image-card" key={image.id}>
-        {/* Generated result URLs are local object URLs created from the API response. */}
+        {/* Card previews use the small WebP sidecar; the original stays on disk. */}
         <button type="button" className="image-preview-button" onClick={() => setLightboxImage(image)} aria-label="放大查看生成图片">
-          <img src={image.src} alt={displayPrompt(image) || "生成图片"} loading="lazy" decoding="async" />
+          <LazyImage image={image} directory={directory} alt={"生成图片"} />
         </button>
-        <div className="image-overlay"><span>{image.model.replace("nai-diffusion-", "V")}</span><a href={image.src} download={image.filename}>下载原图</a></div>
+        <div className="image-overlay"><span>{image.model.replace("nai-diffusion-", "V")}</span><button type="button" className="image-download-button" onClick={() => downloadImage(image)}>下载原图</button></div>
         <div className="image-card-footer">
           <div className="image-card-actions">
             <button type="button" className={`image-favorite-button${favorite ? " active" : ""}`} onClick={() => toggleArtistThreadFavorite(image.artistPrompt)} aria-pressed={Boolean(favorite)}>{favorite ? "取消收藏" : "收藏画师串"}</button>
@@ -811,7 +1198,7 @@ export default function Home() {
       <article className="artist-thread-card" key={thread.id}>
         <div className="artist-thread-cover-frame">
           <button type="button" className="artist-thread-cover" onClick={() => { setSelectedArtistThreadId(thread.id); }} aria-label={`打开${artistThreadLabel(thread.artistPrompt)}的全部图片`} data-cover-source={favorite?.coverImageId === cover?.id ? "manual" : "latest"}>
-            {cover ? <img src={cover.src} alt={artistThreadLabel(thread.artistPrompt)} loading="lazy" decoding="async" /> : <span className="artist-thread-cover-empty">暂无生成图片</span>}
+            {cover ? <LazyImage image={cover} directory={directory} alt={artistThreadLabel(thread.artistPrompt)} /> : <span className="artist-thread-cover-empty">暂无生成图片</span>}
           </button>
           <div className="artist-thread-cover-caption">
             <h3 className="artist-thread-card-title" title={artistThreadLabel(thread.artistPrompt)}>{artistThreadLabel(thread.artistPrompt)}</h3>
@@ -827,6 +1214,33 @@ export default function Home() {
       </article>
     );
   }
+
+  // Browsers without the File System Access API cannot store images locally,
+  // so the whole workbench is replaced with a clear upgrade prompt.
+  if (!fsSupported) {
+    return (
+      <main className="app-shell" id="main-content">
+        <a className="skip-link" href="#main-content">跳到主要内容</a>
+        <header className="topbar">
+          <a className="brand" href="#top" aria-label="Nova Canvas 首页">
+            <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
+            <span>NOVA <b>CANVAS</b></span>
+          </a>
+        </header>
+        <section className="canvas-area" id="top" aria-label="浏览器不支持提示">
+          <div className="canvas-scroll">
+            <div className="empty-result">
+              <div className="empty-art"><i /><i /><span aria-hidden="true" /></div>
+              <h3>需要支持本地文件夹的浏览器</h3>
+              <p>Nova Canvas 现在把作品直接保存到你授权的本地文件夹，不再占用浏览器存储。请使用桌面版 Chrome 或 Edge 打开本页。</p>
+            </div>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
+  const visibleImages = images.slice(0, visibleCount);
 
   return (
     <main className="app-shell" id="main-content">
@@ -917,11 +1331,21 @@ export default function Home() {
             <section className="rail-section connection-panel">
               <button type="button" className="rail-accordion" onClick={() => setConnectionOpen((value) => !value)} aria-expanded={connectionOpen}>
                 <span className="rail-accordion-title">连接服务</span>
-                <span className={`status-pill small ${apiKey ? "ok" : "warn"}`}><i aria-hidden="true" />{channel === "official" ? "官方渠道" : "中转渠道"} · {apiKey ? "Key 已配置" : "未配置 Key"}</span>
+                <span className={`status-pill small ${directory ? "ok" : "warn"}`}><i aria-hidden="true" />{directoryName ? `文件夹 · ${directoryName}` : "未选择文件夹"}</span>
                 <i className="chevron" aria-hidden="true" />
               </button>
               {connectionOpen && (
                 <div className="rail-accordion-body">
+                  <div className="folder-row">
+                    <div><b>{directoryName || "尚未选择图片文件夹"}</b><small>作品直接保存到此文件夹；IndexedDB 仅存轻量元数据，不再占用浏览器存储</small></div>
+                    <button type="button" onClick={chooseDirectory}>{directoryName ? "更换文件夹" : "选择文件夹"}</button>
+                  </div>
+                  {legacyCount > 0 && (
+                    <div className="folder-row">
+                      <div><b>{legacyCount} 条旧记录仍在浏览器中</b><small>迁移后图片会导入到文件夹，浏览器记录只保留元数据</small></div>
+                      <button type="button" onClick={migrateLegacyData} disabled={Boolean(migrationState?.running)}>{migrationState?.running ? `迁移中 ${migrationState.done}/${migrationState.total}` : "迁移旧数据"}</button>
+                    </div>
+                  )}
                   <div className="channel-switch" role="radiogroup" aria-label="生成渠道">
                     <button type="button" role="radio" aria-checked={channel === "official"} className={channel === "official" ? "active" : ""} onClick={() => setChannel("official")}>
                       <span className="channel-icon official-icon">N</span>
@@ -950,10 +1374,6 @@ export default function Home() {
                       {rememberKey && apiKey && <button type="button" onClick={forgetApiKey}>清除 Key</button>}
                     </div>
                     <p>Key 不会写入图片或 JSON，但同一浏览器中的脚本、本机用户及扩展可能读取它。</p>
-                    <div className="folder-row">
-                      <div><b>{directoryName || "尚未选择图片文件夹"}</b><small>图片始终保存在浏览器；授权后同时写入图片文件和 nova-canvas.json</small></div>
-                      <button type="button" onClick={chooseDirectory}>{directoryName ? "更换文件夹" : "选择文件夹"}</button>
-                    </div>
                   </div>
                 </div>
               )}
@@ -1036,31 +1456,21 @@ export default function Home() {
                   </section>
                 )}
               </section>
+            ) : !directory ? (
+              <div className="empty-result"><div className="empty-art"><i /><i /><span aria-hidden="true" /></div><h3>先选择一个图片文件夹</h3><p>作品会直接保存到你授权的本地文件夹，不再占用浏览器存储。请在左侧「连接服务」中选择文件夹后开始生成。</p></div>
             ) : images.length === 0 ? (
               <div className="empty-result"><div className="empty-art"><i /><i /><span aria-hidden="true" /></div><h3>画布已经准备好了</h3><p>完成左侧设置并开始生成，你的作品会出现在这里。</p><ol className="empty-steps"><li><b>1</b><span><strong>选择渠道</strong>官方直连，或使用兼容的中转服务。</span></li><li><b>2</b><span><strong>输入密钥</strong>Key 只参与当前请求，刷新即清除。</span></li><li><b>3</b><span><strong>描述并生成</strong>调整参数，然后等待作品完成。</span></li></ol></div>
             ) : (
-              <div className="image-grid">
-                {images.map((image) => (
-                  <article className="image-card" key={image.id}>
-                    {/* Generated result URLs are local object URLs created from the API response. */}
-                    <button type="button" className="image-preview-button" onClick={() => setLightboxImage(image)} aria-label="放大查看生成图片">
-                      <img src={image.src} alt={displayPrompt(image) || "生成图片"} loading="lazy" decoding="async" />
-                    </button>
-                    <div className="image-overlay"><span>{image.model.replace("nai-diffusion-", "V")}</span><a href={image.src} download={image.filename}>下载原图</a></div>
-                    <div className="image-card-footer">
-                      <div className="image-card-actions">
-                        <button type="button" className={`image-favorite-button${favoriteForThread(artistThreadKey(image.artistPrompt), image.artistPrompt) ? " active" : ""}`} onClick={() => toggleArtistThreadFavorite(image.artistPrompt)} aria-pressed={Boolean(favoriteForThread(artistThreadKey(image.artistPrompt), image.artistPrompt))}>{favoriteForThread(artistThreadKey(image.artistPrompt), image.artistPrompt) ? "取消收藏" : "收藏画师串"}</button>
-                        {(() => {
-                          const thread = artistThreads.find((candidate) => candidate.id === artistThreadKey(image.artistPrompt));
-                          const favorite = thread?.favorite;
-                          return favorite && thread ? <button type="button" className="image-cover-button" onClick={() => setArtistThreadCover(thread, image.id)}>{favorite.coverImageId === image.id ? "当前封面" : "设为封面"}</button> : null;
-                        })()}
-                        <button type="button" className="image-reuse-button" onClick={() => reuseGeneration(image)}>再次使用提示词</button>
-                      </div>
-                    </div>
-                  </article>
-                ))}
-              </div>
+              <>
+                <div className="image-grid">
+                  {visibleImages.map((image) => renderImageCard(image))}
+                </div>
+                {visibleCount < images.length && (
+                  <div className="load-more-row">
+                    <button type="button" className="load-more-button" onClick={() => setVisibleCount((current) => current + PAGE_SIZE)}>加载更多（剩余 {images.length - visibleCount} 张）</button>
+                  </div>
+                )}
+              </>
             )}
           </div>
         </section>
@@ -1077,14 +1487,32 @@ export default function Home() {
               <button type="button" className="image-lightbox-close" onClick={() => setLightboxImage(null)} aria-label="关闭图片预览"><span aria-hidden="true" /></button>
             </div>
             <div className="image-lightbox-body">
-              <div className="image-lightbox-stage">
-                <img className="image-lightbox-image" src={lightboxImage.src} alt={displayPrompt(lightboxImage) || "生成图片"} />
-                {images.length > 1 && (
+              <div
+                className={`image-lightbox-stage${lightboxZoom > 1 ? " zoomed" : ""}`}
+                ref={lightboxStageRef}
+                onPointerDown={onLightboxPointerDown}
+                onPointerMove={onLightboxPointerMove}
+                onPointerUp={onLightboxPointerUp}
+                onPointerCancel={onLightboxPointerUp}
+                onDoubleClick={() => (lightboxZoom > 1 ? resetLightboxZoom() : setLightboxZoom(2.5))}
+              >
+                {lightboxSrc ? (
+                  <img className="image-lightbox-image" src={lightboxSrc} alt={"生成图片"} draggable={false} style={{ transform: `translate(${lightboxPan.x}px, ${lightboxPan.y}px) scale(${lightboxZoom})` }} onError={() => setLightboxSrc(undefined)} />
+                ) : (
+                  <div className="image-lightbox-image lazy-image-placeholder" aria-hidden="true" />
+                )}
+                {images.length > 1 && lightboxZoom === 1 && (
                   <>
                     <button type="button" className="image-lightbox-nav prev" onClick={() => stepLightbox(-1)} aria-label="上一张图片"><span aria-hidden="true" /></button>
                     <button type="button" className="image-lightbox-nav next" onClick={() => stepLightbox(1)} aria-label="下一张图片"><span aria-hidden="true" /></button>
                   </>
                 )}
+                <div className="zoom-controls" onPointerDown={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}>
+                  <button type="button" onClick={() => adjustLightboxZoom(-0.25)} disabled={lightboxZoom <= 1} aria-label="缩小">−</button>
+                  <span>{Math.round(lightboxZoom * 100)}%</span>
+                  <button type="button" onClick={() => adjustLightboxZoom(0.25)} disabled={lightboxZoom >= 4} aria-label="放大">+</button>
+                  <button type="button" className="zoom-reset" onClick={resetLightboxZoom} disabled={lightboxZoom === 1}>重置</button>
+                </div>
               </div>
               <aside className="image-lightbox-side">
                 {lightboxImage.artistPrompt.trim() && (
@@ -1122,7 +1550,7 @@ export default function Home() {
                 <p className="lightbox-file">{lightboxImage.filename}{lightboxImage.createdAt ? ` · ${new Date(lightboxImage.createdAt).toLocaleString()}` : ""}</p>
                 <div className="image-lightbox-actions">
                   <button type="button" className="image-reuse-button" onClick={() => reuseGeneration(lightboxImage)}>再次使用提示词</button>
-                  <a href={lightboxImage.src} download={lightboxImage.filename}>下载原图</a>
+                  {lightboxSrc ? <a href={lightboxSrc} download={lightboxImage.filename}>下载原图</a> : null}
                 </div>
               </aside>
             </div>
