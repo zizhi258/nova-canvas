@@ -27,6 +27,7 @@ import {
   StoredGeneration,
 } from "./local-persistence";
 import TagMarket from "./tag-market";
+import { decodeBase64Image, detectImageMimeType } from "../features/generation/protocol/image-response";
 
 type Channel = "official" | "relay";
 
@@ -149,21 +150,6 @@ function artistThreadLabel(value: string) {
   return normalizedArtistPrompt(value) || "未填写画师串";
 }
 
-function imageType(name: string, bytes: Uint8Array) {
-  const lower = name.toLowerCase();
-  if (lower.endsWith(".webp") || (bytes[0] === 0x52 && bytes[1] === 0x49)) return "image/webp";
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || (bytes[0] === 0xff && bytes[1] === 0xd8)) return "image/jpeg";
-  return "image/png";
-}
-
-function decodeBase64Image(value: string) {
-  const normalized = value.includes(",") ? value.split(",").pop()! : value;
-  const binary = atob(normalized);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-  return bytes;
-}
-
 /** Copy text with a fallback for non-secure contexts where clipboard API is unavailable. */
 async function copyText(value: string) {
   if (navigator.clipboard?.writeText) {
@@ -207,12 +193,12 @@ async function officialImage(response: Response) {
     const candidate = data.images?.[0] ?? data.data?.[0];
     if (typeof candidate === "string") {
       const bytes = decodeBase64Image(candidate);
-      return new Blob([bytes.slice().buffer], { type: imageType("result", bytes) });
+      return new Blob([bytes.slice().buffer], { type: detectImageMimeType("result", bytes) });
     }
     const encoded = candidate?.image || candidate?.b64_json || ("base64" in (candidate || {}) ? candidate?.base64 : undefined) || ("data" in (candidate || {}) ? candidate?.data : undefined);
     if (encoded) {
       const bytes = decodeBase64Image(encoded);
-      return new Blob([bytes.slice().buffer], { type: imageType("result", bytes) });
+      return new Blob([bytes.slice().buffer], { type: detectImageMimeType("result", bytes) });
     }
     if (candidate?.url) {
       const image = await fetch(candidate.url);
@@ -227,7 +213,7 @@ async function officialImage(response: Response) {
     const files = unzipSync(archive);
     const entry = Object.entries(files).find(([name]) => /\.(png|jpe?g|webp)$/i.test(name));
     if (!entry) throw new Error("压缩包中没有图片");
-    return new Blob([entry[1].slice().buffer], { type: imageType(entry[0], entry[1]) });
+    return new Blob([entry[1].slice().buffer], { type: detectImageMimeType(entry[0], entry[1]) });
   } catch {
     throw new Error("NovelAI 返回的图片数据无法解压。 ");
   }

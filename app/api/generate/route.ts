@@ -1,3 +1,5 @@
+import { decodeBase64Image, detectImageMimeType } from "../../../features/generation/protocol/image-response";
+
 export const runtime = "edge";
 
 type GenerateRequest = {
@@ -32,14 +34,6 @@ function normalizeRelayUrl(value: string) {
   if (!path || path === "/") url.pathname = "/v1/images/generations";
   else if (path.endsWith("/v1")) url.pathname = `${path}/images/generations`;
   return url.toString();
-}
-
-function decodeBase64(value: string) {
-  const normalized = value.includes(",") ? value.split(",").pop()! : value;
-  const binary = atob(normalized);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return bytes;
 }
 
 export async function POST(request: Request) {
@@ -119,8 +113,8 @@ export async function POST(request: Request) {
       const data = (await upstream.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
       const item = data.data?.[0];
       if (item?.b64_json) {
-        const bytes = decodeBase64(item.b64_json);
-        return new Response(bytes, { headers: { "Content-Type": imageType("result", bytes), "Cache-Control": "no-store" } });
+        const bytes = decodeBase64Image(item.b64_json);
+        return new Response(bytes, { headers: { "Content-Type": detectImageMimeType("result", bytes), "Cache-Control": "no-store" } });
       }
       if (item?.url) {
         const image = await fetch(item.url);

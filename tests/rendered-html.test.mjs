@@ -14,6 +14,31 @@ test("ships the Nova Canvas product experience", async () => {
   assert.doesNotMatch(page, /SkeletonPreview/);
 });
 
+test("shares image response decoding between the client and relay route", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const route = await readFile(new URL("../app/api/generate/route.ts", import.meta.url), "utf8");
+  const protocol = await readFile(new URL("../features/generation/protocol/image-response.ts", import.meta.url), "utf8");
+
+  assert.match(page, /from "\.\.\/features\/generation\/protocol\/image-response"/);
+  assert.match(route, /from "\.\.\/\.\.\/\.\.\/features\/generation\/protocol\/image-response"/);
+  assert.match(protocol, /export function decodeBase64Image/);
+  assert.match(protocol, /export function detectImageMimeType/);
+  assert.match(page, /detectImageMimeType\(/);
+  assert.match(route, /detectImageMimeType\(/);
+  assert.doesNotMatch(page, /function imageType\(/);
+  assert.doesNotMatch(route, /function decodeBase64\(/);
+  assert.doesNotMatch(route, /imageType\(/);
+});
+
+test("decodes base64 image data and detects common image MIME types", async () => {
+  const { decodeBase64Image, detectImageMimeType } = await import("../features/generation/protocol/image-response.ts");
+
+  assert.deepEqual([...decodeBase64Image("data:image/png;base64,AQID")], [1, 2, 3]);
+  assert.equal(detectImageMimeType("result.webp", new Uint8Array()), "image/webp");
+  assert.equal(detectImageMimeType("result", new Uint8Array([0xff, 0xd8])), "image/jpeg");
+  assert.equal(detectImageMimeType("result", new Uint8Array([0x89, 0x50])), "image/png");
+});
+
 test("tag market keeps complete-path recursive navigation", async () => {
   const source = await readFile(new URL("../app/tag-market.tsx", import.meta.url), "utf8");
 

@@ -609,3 +609,26 @@ Lightbox 的索引、缩放、位移和键盘事件放入 `useLightbox` 或组�
 5. 对比重构前后的生成、取消、下载、收藏和旧数据加载行为。
 
 完成后再根据实际 props 和状态流决定 `CanvasWorkbench`、queue hook 与 storage facade 的最终接口。这样架构来自真实依赖，而不是预先套用模板。
+
+## 12. 实施记录
+
+### 2026-08-07：第一步最小安全重构
+
+已完成：
+
+- 新增 `features/generation/protocol/image-response.ts`，集中提供 `decodeBase64Image` 和 `detectImageMimeType`；该模块只依赖浏览器与 Edge runtime 都支持的 Web API。
+- `app/page.tsx` 改为使用共享图片响应工具，移除页面内重复的 base64 解码和 MIME 判断实现。
+- `app/api/generate/route.ts` 改为使用共享工具，并以 `detectImageMimeType` 替换原未定义的 `imageType`，修复该类型检查错误来源。
+- `tests/rendered-html.test.mjs` 增加客户端、Route 与共享协议之间的回归断言，并直接验证 base64 解码及 WebP/JPEG/PNG MIME 判断行为。
+
+本次未做：
+
+- 未拆分 `Home`、生成队列、图库、持久化或 TagMarket 组件与状态。
+- 未改变 API 请求格式、图片响应格式、IndexedDB/文件系统 schema 或 CSS。
+- 未处理本轮范围之外的 Worker/D1 类型、Node 版本或其他 lint 告警。
+
+验证结果：
+
+- `pnpm exec tsc --noEmit --incremental false --target ES2017 --lib 'dom,dom.iterable,esnext' --module esnext --moduleResolution bundler --strict --skipLibCheck features/generation/protocol/image-response.ts app/api/generate/route.ts`：通过；完整 `pnpm exec tsc --noEmit` 仍被仓库既有的 Cloudflare 类型缺失阻断：`db/index.ts` 找不到 `cloudflare:workers`，`worker/index.ts` 找不到 `Fetcher`/`D1Database`。
+- 使用工作区 Node 24 运行目标文件 ESLint：共享协议和 Route 未产生新问题；检查仍因 `app/page.tsx` 既有的 Lightbox effect 同步 setState 报 1 个错误，并保留 2 个 `<img>` 性能告警。
+- 使用工作区 Node 24 运行 `node --test tests/rendered-html.test.mjs`：新增的共享图片响应结构与行为测试通过；全量文件中有 4 条既有源码断言失败（Lightbox/favorites 样式断言），与本次改动无关。
